@@ -152,6 +152,7 @@ export const ACTION_IDS = [
  "edit",
  "duplicate",
  "squash",
+ "squash-hunks",
  "absorb",
  "insert-before",
  "insert-after",
@@ -173,6 +174,9 @@ export const actionRpc = defineRpc({
   message: z.string().optional(),
   revset: z.string().optional(),
   paths: z.array(z.string()).optional(),
+  /** Hunks of that one file to move, by their index in the file's diff. Only
+   *  `squash-hunks` reads it; jj itself can only move whole paths. */
+  hunkIndexes: z.array(z.number().int().nonnegative()).optional(),
   /** Bookmark the bookmark actions act on. */
   name: z.string().optional(),
   /** The other revision: the second parent of a merge, the destination of a

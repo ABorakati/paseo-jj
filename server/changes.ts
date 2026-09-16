@@ -1,6 +1,9 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { RpcInput, RpcOutput } from "@getpaseo/plugin";
 import { actionRpc, diffRpc, snapshotRpc } from "../shared/contracts";
-import { describeFile, parseGitDiff, shouldHighlight } from "./diff";
+import { applyHunks, describeFile, parseGitDiff, shouldHighlight } from "./diff";
 import {
  findRepoRoot,
  hasJj,
@@ -8,6 +11,7 @@ import {
  listChangedFiles,
  listChanges,
  listConflictedPaths,
+ normalizePath,
  readCurrentDescription,
  runJj,
 } from "./jj";
@@ -153,12 +157,107 @@ export async function diff({
  };
 }
 
+/** The merge tool jj is pointed at for one hunk move. It is defined inline with
+ *  `--config`, so no repository config is written and nothing is left behind. */
+const HUNK_TOOL = "jj-panel-squash";
+
+/**
+ * jj gives a diff editor two directories and adopts whatever the right one
+ * holds as the destination's new content. That is the only non-interactive way
+ * to move part of a file, so the wanted text is computed here and this script
+ * puts it in place.
+ */
+const HUNK_SCRIPT = [
+ 'const { mkdirSync, readFileSync, writeFileSync } = require("node:fs");',
+ 'const { dirname, join } = require("node:path");',
+ "const [, , _left, right, wanted, rel] = process.argv;",
+ "const target = join(right, rel);",
+ "mkdirSync(dirname(target), { recursive: true });",
+ "writeFileSync(target, readFileSync(wanted));",
+].join("\n");
+
+interface HunkSquash {
+ args: string[];
+ /** Removes the script and the wanted text jj read during the command. */
+ cleanup(): void;
+}
+
+/**
+ * Everything one hunk move needs: the file's diff between the two revisions,
+ * the destination's copy of the file, and the same copy with the selected hunks
+ * applied. jj's own diff editor is a process, and the panel has no editor, so
+ * the wanted text is handed over by a script in a temp directory. Building it
+ * from the destination's copy is what makes any ancestor work as the target,
+ * not just the parent.
+ */
+async function prepareHunkSquash(
+ root: string,
+ from: string,
+ into: string,
+ path: string,
+ indexes: number[],
+): Promise<HunkSquash | { error: string }> {
+ const shown = await runJj(["diff", "--git", "--from", into, "--to", from, "--", path], root);
+ if (!shown.ok) return { error: shown.stderr || "jj diff failed." };
+ const file = parseGitDiff(shown.stdout).files[0];
+ if (!file) return { error: "That file has no changes between those revisions." };
+ if (file.binary) return { error: "Binary files cannot be squashed by hunk." };
+ // A rename moves the file's name as well as its content, and an added or
+ // removed file has no other side to apply hunks to; both are whole-path moves.
+ if (file.status !== "modified") {
+  return { error: `A ${file.status} file can only be squashed whole.` };
+ }
+ if (indexes.some((index) => index >= file.hunks.length)) {
+  return { error: "Those hunks are no longer in this diff. Refresh and try again." };
+ }
+
+ const existing = await runJj(["file", "show", "-r", into, "--", path], root);
+ if (!existing.ok) return { error: existing.stderr || "Could not read that file from the destination." };
+ const wanted = applyHunks(existing.stdout, file.hunks, indexes);
+ if (wanted === null) {
+  return { error: "That file changed since the diff was drawn. Refresh and try again." };
+ }
+
+ const dir = mkdtempSync(join(tmpdir(), "paseo-jj-squash-"));
+ const wantedFile = join(dir, "wanted");
+ writeFileSync(wantedFile, wanted);
+ const script = join(dir, "apply.cjs");
+ writeFileSync(script, HUNK_SCRIPT);
+
+ // jj parses each `--config` value as TOML, and a Windows path is not valid
+ // TOML; JSON's escapes are, so every path goes through JSON.stringify.
+ const config = (key: string, value: unknown) =>
+  `--config=merge-tools.${HUNK_TOOL}.${key}=${JSON.stringify(value)}`;
+ const relative = normalizePath(path);
+ const tool = [script, "$left", "$right", wantedFile, relative];
+ return {
+  args: [
+   "squash",
+   "--from",
+   from,
+   "--into",
+   into,
+   "--tool",
+   HUNK_TOOL,
+   // The tool is spawned directly: node is the interpreter this server already
+   // runs under, so no shell is involved and nothing else has to be on PATH.
+   config("program", process.execPath),
+   config("merge-args", tool),
+   config("edit-args", tool),
+   "--",
+   path,
+  ],
+  cleanup: () => rmSync(dir, { recursive: true, force: true }),
+ };
+}
+
 export async function action({
  directory,
  action: kind,
  message,
  revset,
  paths,
+ hunkIndexes,
  name,
  target,
 }: RpcInput<typeof actionRpc>): Promise<RpcOutput<typeof actionRpc>> {
@@ -170,6 +269,8 @@ export async function action({
  if (revset && !revision) return { ok: false, error: "Invalid revision.", output: "" };
 
  let args: string[];
+ /** Set by a case that prepared files on disk for jj to read. */
+ let cleanup: (() => void) | null = null;
  switch (kind) {
   case "commit":
    if (!text) return { ok: false, error: "A commit message is required.", output: "" };
@@ -244,11 +345,36 @@ export async function action({
   }
   case "squash": {
    const into = target ? safeArg(target) : null;
+   // With no paths the whole revision moves, which is the verb the panel has
+   // always offered. With paths jj moves only those files; a selection that
+   // names nothing is refused the way `restore` refuses it.
+   if (paths !== undefined) {
+    const selected = paths.map(safeArg).filter((value): value is string => value !== null);
+    if (selected.length !== paths.length) return { ok: false, error: "Invalid path.", output: "" };
+    if (selected.length === 0) return { ok: false, error: "Select at least one file.", output: "" };
+    args = into
+     ? ["squash", "--from", revision ?? "@", "--into", into, "--", ...selected]
+     : ["squash", "-r", revision ?? "@", "--", ...selected];
+    break;
+   }
    // Without `--into` the source squashes into its parent, which is the move
    // people reach for most: fold this change into the one below it.
    args = into
     ? ["squash", "--from", revision ?? "@", "--into", into]
     : ["squash", "-r", revision ?? "@"];
+   break;
+  }
+  case "squash-hunks": {
+   const into = target ? safeArg(target) : null;
+   if (!into) return { ok: false, error: "Pick a destination revision.", output: "" };
+   const file = paths && paths.length === 1 ? safeArg(paths[0]) : null;
+   if (!file) return { ok: false, error: "Pick one file to squash.", output: "" };
+   const wanted = (hunkIndexes ?? []).filter((index) => Number.isInteger(index) && index >= 0);
+   if (wanted.length === 0) return { ok: false, error: "Select at least one hunk.", output: "" };
+   const prepared = await prepareHunkSquash(root, revision ?? "@", into, file, wanted);
+   if ("error" in prepared) return { ok: false, error: prepared.error, output: "" };
+   args = prepared.args;
+   cleanup = prepared.cleanup;
    break;
   }
   case "absorb":
@@ -280,10 +406,14 @@ export async function action({
    return { ok: false, error: "Unsupported action.", output: "" };
  }
 
- const result = await runJj(args, root);
- return {
-  ok: result.ok,
-  error: result.ok ? null : result.stderr || "jj command failed.",
-  output: (result.stdout || result.stderr).trim(),
- };
+ try {
+  const result = await runJj(args, root);
+  return {
+   ok: result.ok,
+   error: result.ok ? null : result.stderr || "jj command failed.",
+   output: (result.stdout || result.stderr).trim(),
+  };
+ } finally {
+  cleanup?.();
+ }
 }

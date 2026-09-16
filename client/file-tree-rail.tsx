@@ -2,6 +2,7 @@ import type { PluginTheme } from "@getpaseo/plugin";
 import { Icon } from "@getpaseo/plugin/client/react-native";
 import { useCallback, useMemo } from "react";
 import { FlatList, Pressable, Text, View } from "react-native";
+import type { PressableProps } from "react-native";
 import { STATUS_LABEL, statusColor } from "./diff-view";
 import type { FileTreeRow } from "./file-tree";
 import type { DiffPalette } from "./palette";
@@ -46,6 +47,16 @@ interface FileTreeRailProps {
  rows: FileTreeRow[];
  collapsed: ReadonlySet<string>;
  selectedPath: string | null;
+ /** Paths picked for a move into another revision. */
+ checked: ReadonlySet<string>;
+ /** True when every changed file is picked, so the box reads as a single
+  *  select-all that can also clear the selection. */
+ allChecked: boolean;
+ /** True while a move is in flight, which the row's button waits on. */
+ busy: boolean;
+ onToggleChecked(path: string): void;
+ onToggleCheckAll(): void;
+ onSquashChecked(): void;
  allCollapsed: boolean;
  /** True while the diff for the picked revision is still in flight, so an empty
   *  tree reads as loading rather than as a revision with no changes. */
@@ -63,6 +74,40 @@ interface FileTreeRailProps {
 }
 
 /**
+ * A pick box is a checkbox to assistive tech, and the state is what it has to
+ * read. react-native-web forwards `accessibilityRole` but drops
+ * `accessibilityState`, so the aria attribute is passed directly — a native
+ * build never sees the unknown key.
+ */
+const ariaChecked = (checked: boolean) => ({ "aria-checked": checked }) as unknown as PressableProps;
+
+/**
+ * The pick box. It is drawn rather than taken from the icon set: it is the
+ * control the whole move hangs on, so it must not depend on an icon name the
+ * host may not carry.
+ */
+function CheckBox({ checked, theme }: { checked: boolean; theme: PluginTheme }) {
+ return (
+  <View
+   style={{
+    width: 13,
+    height: 13,
+    borderRadius: 3,
+    borderWidth: 1,
+    borderColor: checked ? theme.colors.accent : theme.colors.border,
+    backgroundColor: checked ? theme.colors.accent : "transparent",
+    alignItems: "center",
+    justifyContent: "center",
+   }}
+  >
+   {checked ? (
+    <Text style={{ color: theme.colors.accentForeground, fontSize: 10, lineHeight: 11 }}>✓</Text>
+   ) : null}
+  </View>
+ );
+}
+
+/**
  * The rail beside the diff: one row per directory and file, in the order the
  * diff below lists them. A folder row carries its subtree's totals, so the
  * shape of a change stays readable while the folder is shut.
@@ -71,6 +116,12 @@ export function FileTreeRail({
  rows,
  collapsed,
  selectedPath,
+ checked,
+ allChecked,
+ busy,
+ onToggleChecked,
+ onToggleCheckAll,
+ onSquashChecked,
  allCollapsed,
  loading,
  flex,
@@ -109,6 +160,40 @@ export function FileTreeRail({
     fontFamily: metrics.fontFamily,
    },
    empty: { color: palette.filePathMuted, fontSize: metrics.fontSize, padding: 12 },
+   /** The click target for picking a file, kept out of the row's own press so
+    *  the two never answer the same click. */
+   check: {
+    width: 16,
+    height: 16,
+    alignItems: "center" as const,
+    justifyContent: "center" as const,
+    flexShrink: 0,
+   },
+   hit: {
+    flexDirection: "row" as const,
+    alignItems: "center" as const,
+    gap: 6,
+    flex: 1,
+    minWidth: 0,
+   },
+   selectBar: {
+    flexDirection: "row" as const,
+    alignItems: "center" as const,
+    gap: 6,
+    paddingHorizontal: BASE_INDENT,
+    paddingVertical: 5,
+   },
+   count: { color: palette.filePathMuted, fontSize: metrics.fontSize - 1 },
+   move: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: palette.splitDivider,
+    backgroundColor: theme.colors.surface1,
+   },
+   moveText: { color: palette.filePath, fontSize: metrics.fontSize - 1 },
+   idle: { opacity: 0.45 },
   }),
   [palette, metrics, theme],
  );
@@ -146,33 +231,56 @@ export function FileTreeRail({
     );
    }
    return (
-    <Pressable
-     accessibilityRole="button"
-     accessibilityLabel={`Show ${item.path} in the diff`}
-     onPress={() => onSelectFile(item.path)}
-     style={({ pressed, hovered }: { pressed: boolean; hovered?: boolean }) => [
-      styles.row,
-      { paddingLeft: paddingLeft + GLYPH },
-      selectedPath === item.path || pressed || hovered ? styles.rowActive : null,
-     ]}
-    >
-     <Text style={[styles.status, { color: statusColor(item.status, palette) }]}>
-      {STATUS_LABEL[item.status]}
-     </Text>
-     <Text style={styles.label} numberOfLines={1}>
-      {item.label}
-     </Text>
-     <View style={{ flex: 1 }} />
-     <Counts
-      additions={item.additions}
-      deletions={item.deletions}
-      palette={palette}
-      metrics={metrics}
-     />
-    </Pressable>
+    <View style={[styles.row, { paddingLeft: paddingLeft + GLYPH }]}>
+     <Pressable
+      {...ariaChecked(checked.has(item.path))}
+      accessibilityRole="checkbox"
+      accessibilityLabel={`${checked.has(item.path) ? "Deselect" : "Select"} ${item.path}`}
+      accessibilityState={{ checked: checked.has(item.path) }}
+      onPress={() => onToggleChecked(item.path)}
+      hitSlop={6}
+      style={styles.check}
+     >
+      <CheckBox checked={checked.has(item.path)} theme={theme} />
+     </Pressable>
+     <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={`Show ${item.path} in the diff`}
+      onPress={() => onSelectFile(item.path)}
+      style={({ pressed, hovered }: { pressed: boolean; hovered?: boolean }) => [
+       styles.hit,
+       selectedPath === item.path || pressed || hovered ? styles.rowActive : null,
+      ]}
+     >
+      <Text style={[styles.status, { color: statusColor(item.status, palette) }]}>
+       {STATUS_LABEL[item.status]}
+      </Text>
+      <Text style={styles.label} numberOfLines={1}>
+       {item.label}
+      </Text>
+      <View style={{ flex: 1 }} />
+      <Counts
+       additions={item.additions}
+       deletions={item.deletions}
+       palette={palette}
+       metrics={metrics}
+      />
+     </Pressable>
+    </View>
    );
   },
-  [collapsed, metrics, onSelectFile, onToggleFolder, palette, selectedPath, styles],
+  [
+   checked,
+   collapsed,
+   metrics,
+   onSelectFile,
+   onToggleChecked,
+   onToggleFolder,
+   palette,
+   selectedPath,
+   styles,
+   theme,
+  ],
  );
 
  // A minimized section must not carry a flex value: `flex: 0` resolves to a
@@ -205,6 +313,32 @@ export function FileTreeRail({
      )
     }
    />
+   {minimized ? null : (
+    <View style={styles.selectBar}>
+     <Pressable
+      {...ariaChecked(allChecked)}
+      accessibilityRole="checkbox"
+      accessibilityLabel={allChecked ? "Clear the file selection" : "Select every changed file"}
+      accessibilityState={{ checked: allChecked }}
+      onPress={onToggleCheckAll}
+      hitSlop={6}
+      style={styles.check}
+     >
+      <CheckBox checked={allChecked} theme={theme} />
+     </Pressable>
+     <Text style={styles.count}>{checked.size} selected</Text>
+     <View style={{ flex: 1 }} />
+     <Pressable
+      accessibilityRole="button"
+      accessibilityLabel="Move the selected files into another revision"
+      onPress={onSquashChecked}
+      disabled={checked.size === 0 || busy}
+      style={[styles.move, checked.size === 0 || busy ? styles.idle : null]}
+     >
+      <Text style={styles.moveText}>Squash…</Text>
+     </Pressable>
+    </View>
+   )}
    {minimized ? null : (
     <FlatList
      data={rows}

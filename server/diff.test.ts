@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { describeFile, parseGitDiff, shouldHighlight } from "./diff";
+import { applyHunks, describeFile, parseGitDiff, shouldHighlight } from "./diff";
 import { languageForPath, tokenizeLines } from "./tokenize";
 
 /**
@@ -83,6 +83,41 @@ const MULTI_HUNK = `diff --git a/big.ts b/big.ts
 function tokensToText(line: { tokens: Array<{ t: string }> }): string {
  return line.tokens.map((token) => token.t).join("");
 }
+
+/** Two hunks where the first grows the file, so the second's offset matters. */
+const GROWING = `diff --git a/grow.txt b/grow.txt
+--- a/grow.txt
++++ b/grow.txt
+@@ -1,3 +1,4 @@
+ a
+-b
++B
++B2
+ c
+@@ -10,3 +11,3 @@
+-j
++J
+ k
+ l
+`;
+
+/** A hunk that only adds lines: its old side is empty, not a line. */
+const INSERTED = `diff --git a/mid.txt b/mid.txt
+--- a/mid.txt
++++ b/mid.txt
+@@ -2,0 +3,2 @@
++added one
++added two
+`;
+
+/** A file emptied in place, which is not the same as a deleted file. */
+const EMPTIED = `diff --git a/emptied.txt b/emptied.txt
+--- a/emptied.txt
++++ b/emptied.txt
+@@ -1,2 +0,0 @@
+-a
+-b
+`;
 
 // --- modified file --------------------------------------------------------
 {
@@ -240,5 +275,57 @@ function tokensToText(line: { tokens: Array<{ t: string }> }): string {
 
 assert.equal(shouldHighlight(10), true);
 assert.equal(shouldHighlight(10_000), false);
+
+// --- applying selected hunks ---------------------------------------------
+// The hunk move hands jj a file whose whole content it adopts, so this is the
+// step that decides what actually moves: a wrong offset here writes the wrong
+// bytes into the destination revision.
+{
+ const before = [
+  "one",
+  "two",
+  "three",
+  ...Array.from({ length: 16 }, (_, index) => `filler${index + 4}`),
+  "twenty",
+  "twentyOne",
+  "twentyTwo",
+ ];
+ const text = `${before.join("\n")}\n`;
+ const withAt = (at: number, value: string) =>
+  `${before.map((entry, index) => (index === at - 1 ? value : entry)).join("\n")}\n`;
+
+ const multi = parseGitDiff(MULTI_HUNK).files[0];
+ assert.equal(multi.hunks.length, 2, "the fixture carries two hunks");
+
+ assert.equal(applyHunks(text, multi.hunks, [0]), withAt(2, "TWO"), "only the first hunk moves");
+ assert.equal(applyHunks(text, multi.hunks, [1]), withAt(21, "twentyone"), "only the second hunk moves");
+ assert.equal(applyHunks(text, multi.hunks, []), text, "no selection leaves the text alone");
+ assert.equal(applyHunks(text, multi.hunks, [5]), null, "an index past the end is refused");
+ assert.equal(
+  applyHunks(text.replace("twenty", "moved"), multi.hunks, [1]),
+  null,
+  "text that no longer matches the hunk's own lines is refused",
+ );
+
+ // The later hunk sits at line 10 and the earlier one adds a line, so the two
+ // only both land if the offsets are resolved back to front.
+ const grow = parseGitDiff(GROWING).files[0];
+ assert.equal(grow.hunks.length, 2);
+ assert.equal(
+  applyHunks(`${["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"].join("\n")}\n`, grow.hunks, [0, 1]),
+  `${["a", "B", "B2", "c", "d", "e", "f", "g", "h", "i", "J", "k", "l"].join("\n")}\n`,
+  "a hunk that grows the file must not shift the hunks above it",
+ );
+
+ // A hunk with no lines on the old side names the line it adds after.
+ const inserted = parseGitDiff(INSERTED).files[0];
+ assert.equal(applyHunks("a\nb\nc\n", inserted.hunks, [0]), "a\nb\nadded one\nadded two\nc\n");
+
+ const added = parseGitDiff(ADDED).files[0];
+ assert.equal(applyHunks("", added.hunks, [0]), "export const one = 1;\nexport const two = 2;");
+
+ const emptied = parseGitDiff(EMPTIED).files[0];
+ assert.equal(applyHunks("a\nb\n", emptied.hunks, [0]), "", "emptying a file leaves no bytes");
+}
 
 console.log("diff.test.ts: all assertions passed");

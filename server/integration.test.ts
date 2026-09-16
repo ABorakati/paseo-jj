@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { action, diff, snapshot } from "./changes";
@@ -333,6 +333,185 @@ async function main(): Promise<void> {
   assert.equal(notARepo.error, null, "not being a repo is not an error");
 
   assert.equal((await diff({ directory: tmpdir(), revset: "@" })).error, "Not a jj workspace.");
+
+  // --- squash by selection ------------------------------------------------
+  // A second repository, because these assertions are about the shape of a
+  // small history: which file a partial squash moves, and where it lands.
+  assert.match(
+   process.execPath,
+   /node(\.exe)?$/i,
+   "the hunk move hands jj a script it runs with this interpreter",
+  );
+  const picked = mkdtempSync(join(tmpdir(), "paseo-jj-picked-"));
+  const pj = (...args: string[]) => execFileSync("jj", args, { cwd: picked, encoding: "utf8" });
+  const pickedId = (revset: string) => pj("log", "--no-graph", "-r", revset, "-T", "change_id").trim();
+  const litter = () =>
+   readdirSync(tmpdir()).filter((name) => name.startsWith("paseo-jj-squash-")).length;
+  try {
+   pj("git", "init", "--colocate");
+   writeFileSync(join(picked, "keep.txt"), "keep\n");
+   writeFileSync(join(picked, "move.txt"), "move\n");
+   writeFileSync(join(picked, "also.txt"), "also\n");
+   pj("commit", "-m", "base");
+   // An empty revision keeps the destination one step below the source, so the
+   // chosen-ancestor case is not the same move as the parent case.
+   pj("describe", "-m", "middle");
+   pj("new");
+   writeFileSync(join(picked, "keep.txt"), "keep\nkeep two\n");
+   writeFileSync(join(picked, "move.txt"), "move\nmove two\n");
+   writeFileSync(join(picked, "also.txt"), "also\nalso two\n");
+   pj("describe", "-m", "source");
+   const baseId = pickedId("@--");
+   const middleId = pickedId("@-");
+   const sourceId = pickedId("@");
+
+   // An empty selection and a path that looks like a flag are refused before jj
+   // is asked anything.
+   assert.equal(
+    (await action({ directory: picked, action: "squash", revset: sourceId, paths: [] })).ok,
+    false,
+    "squashing no files is refused",
+   );
+   assert.equal(
+    (await action({
+     directory: picked,
+     action: "squash",
+     revset: sourceId,
+     paths: ["--config=ui.color=never"],
+    })).ok,
+    false,
+    "a path that looks like a flag is refused",
+   );
+
+   const moved = await action({
+    directory: picked,
+    action: "squash",
+    revset: sourceId,
+    target: middleId,
+    paths: ["move.txt"],
+   });
+   assert.equal(moved.ok, true, moved.error ?? "");
+
+   const middleDiff = await diff({ directory: picked, revset: middleId });
+   assert.deepEqual(
+    middleDiff.files.map((file) => file.path),
+    ["move.txt"],
+    "only the picked file landed in the parent",
+   );
+   assert.ok(
+    pj("file", "show", "-r", middleId, "--", "move.txt").includes("move two"),
+    "the parent's copy holds the moved content",
+   );
+   const sourceAfterMove = await diff({ directory: picked, revset: sourceId });
+   assert.deepEqual(
+    sourceAfterMove.files.map((file) => file.path).sort(),
+    ["also.txt", "keep.txt"],
+    "the file that was not picked stayed in the working copy",
+   );
+
+   // The same file, into an ancestor that is not the parent.
+   assert.ok(
+    !pj("file", "show", "-r", baseId, "--", "keep.txt").includes("keep two"),
+    "the ancestor starts without the edit",
+   );
+   const landed = await action({
+    directory: picked,
+    action: "squash",
+    revset: sourceId,
+    target: baseId,
+    paths: ["keep.txt"],
+   });
+   assert.equal(landed.ok, true, landed.error ?? "");
+   assert.ok(
+    pj("file", "show", "-r", baseId, "--", "keep.txt").includes("keep two"),
+    "the file landed in the chosen ancestor",
+   );
+   const sourceAfterAncestor = await diff({ directory: picked, revset: sourceId });
+   assert.deepEqual(
+    sourceAfterAncestor.files.map((file) => file.path),
+    ["also.txt"],
+    "the moved file left the working copy",
+   );
+
+   // jj's own words, for a move it will not make.
+   const immutable = await action({
+    directory: picked,
+    action: "squash",
+    revset: sourceId,
+    target: "root()",
+    paths: ["also.txt"],
+   });
+   assert.equal(immutable.ok, false, "squashing into the root commit is refused");
+   assert.match(immutable.error ?? "", /immutable/i, `jj said: ${immutable.error}`);
+
+   // --- one hunk of a file, which jj cannot pick out on its own -----------
+   const hunks = (line: number, value: string) =>
+    `${Array.from({ length: 40 }, (_, index) => (index + 1 === line ? value : `l${index + 1}`)).join("\n")}\n`;
+   pj("commit", "-m", "with also");
+   writeFileSync(join(picked, "hunks.txt"), `${Array.from({ length: 40 }, (_, index) => `l${index + 1}`).join("\n")}\n`);
+   pj("describe", "-m", "plain");
+   pj("new");
+   writeFileSync(join(picked, "hunks.txt"), hunks(2, "L2").replace("\nl30\n", "\nL30\n"));
+   pj("describe", "-m", "two hunks");
+   const plainId = pickedId("@-");
+   const hunkSourceId = pickedId("@");
+   assert.equal(
+    (pj("diff", "-r", hunkSourceId, "--git", "--", "hunks.txt").match(/^@@ /gm) ?? []).length,
+    2,
+    "the file carries two hunks, so picking one is a real partial move",
+   );
+
+   const litterBefore = litter();
+   const partial = await action({
+    directory: picked,
+    action: "squash-hunks",
+    revset: hunkSourceId,
+    target: plainId,
+    paths: ["hunks.txt"],
+    hunkIndexes: [0],
+   });
+   assert.equal(partial.ok, true, partial.error ?? "");
+   assert.equal(litter(), litterBefore, "the temp directory jj read is removed");
+
+   const plainFile = pj("file", "show", "-r", plainId, "--", "hunks.txt");
+   assert.ok(plainFile.includes("\nL2\n"), "the parent gained the picked hunk");
+   assert.ok(!plainFile.includes("L30"), "and gained nothing else");
+
+   const keptHunk = pj("diff", "-r", hunkSourceId, "--git", "--", "hunks.txt");
+   assert.ok(keptHunk.includes("+L30"), "the hunk that was not picked stayed in the source");
+   assert.ok(!keptHunk.includes("+L2\n"), "the hunk that moved is gone from the source");
+   assert.equal(
+    (await snapshot({ directory: picked })).graph.find((change) => change.changeId === hunkSourceId)
+     ?.description,
+    "two hunks",
+    "a partial squash leaves the source revision standing",
+   );
+
+   const staleHunk = await action({
+    directory: picked,
+    action: "squash-hunks",
+    revset: hunkSourceId,
+    target: plainId,
+    paths: ["hunks.txt"],
+    hunkIndexes: [9],
+   });
+   assert.equal(staleHunk.ok, false, "a hunk index past the end is refused");
+   assert.equal(
+    (
+     await action({
+      directory: picked,
+      action: "squash-hunks",
+      revset: hunkSourceId,
+      target: plainId,
+      paths: ["hunks.txt", "also.txt"],
+     })
+    ).ok,
+    false,
+    "a hunk move names exactly one file",
+   );
+  } finally {
+   rmSync(picked, { recursive: true, force: true });
+  }
 
   console.log("integration.test.ts: all assertions passed");
  } finally {

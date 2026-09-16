@@ -241,3 +241,46 @@ function plain(content: string): JjDiffLine["tokens"] {
 export function shouldHighlight(totalLines: number): boolean {
  return totalLines <= MAX_HIGHLIGHT_LINES;
 }
+
+/**
+ * The text with only the selected hunks applied: a hunk's removed lines are
+ * replaced by its added ones, in place. `text` is the old side of the diff —
+ * the copy of the file the changes would land in — so the result is what that
+ * copy should hold once the move is done.
+ *
+ * Returns null when the text no longer carries a hunk's own lines, which means
+ * the diff was drawn against other content and applying it would corrupt the
+ * file. The trailing newline of `text` is preserved: the git format's
+ * "no newline at end of file" marker is not part of the hunk.
+ */
+export function applyHunks(text: string, hunks: RawHunk[], selected: readonly number[]): string | null {
+ const trailingNewline = text.endsWith("\n");
+ const lines = text.length === 0 ? [] : text.split("\n");
+ if (trailingNewline) lines.pop();
+
+ // Last hunk first: an earlier hunk changes the line count, which would move
+ // every later hunk's offset out from under it.
+ for (const index of [...selected].sort((a, b) => b - a)) {
+  const hunk = hunks[index];
+  if (!hunk) return null;
+  const before: string[] = [];
+  const after: string[] = [];
+  for (const line of hunk.lines) {
+   if (line.kind !== "add") before.push(line.content);
+   if (line.kind !== "remove") after.push(line.content);
+  }
+  // A hunk that only adds lines names the line it adds them after, not a line
+  // it replaces: `@@ -0,0 +1,2 @@` adds to the front, `@@ -2,0 +3,1 @@` adds
+  // after line 2.
+  const start = before.length === 0 ? hunk.oldStart : hunk.oldStart - 1;
+  const current = lines.slice(start, start + before.length);
+  if (current.length !== before.length) return null;
+  for (let offset = 0; offset < before.length; offset += 1) {
+   if (current[offset] !== before[offset]) return null;
+  }
+  lines.splice(start, before.length, ...after);
+ }
+ // A file with no lines is an empty file: there is no line left for the trailing
+ // newline to terminate.
+ return lines.length === 0 ? "" : lines.join("\n") + (trailingNewline ? "\n" : "");
+}

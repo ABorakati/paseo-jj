@@ -31,13 +31,14 @@ const POLL_MS = 5000;
 
 /** The picker is reused for the branch actions: the title and what a pick means
  *  change, the searchable list does not. */
-type RevisionPickerPurpose = "select" | "merge" | "rebase" | "squash";
+type RevisionPickerPurpose = "select" | "merge" | "rebase" | "squash" | "squash-files";
 
 const PICKER_TITLE: Record<RevisionPickerPurpose, string> = {
  select: "Choose a revision",
  merge: "Merge with…",
  rebase: "Rebase branch onto…",
  squash: "Squash into…",
+ "squash-files": "Move the selected files into…",
 };
 
 /** react-native's ViewStyle has neither key, and both matter on a desktop host:
@@ -116,6 +117,8 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
  const [revisionsMinimized, setRevisionsMinimized] = useState(false);
  const [splitRatio, setSplitRatio] = useState(SPLIT_INITIAL);
  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+ /** Paths picked in the tree, for a move into another revision. */
+ const [checkedPaths, setCheckedPaths] = useState<ReadonlySet<string>>(new Set());
  const [actionsOpen, setActionsOpen] = useState(false);
 
  /** A drag is measured against the size at the moment the press happened. */
@@ -206,6 +209,14 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
  // in this sequence and the diff renders it, so a row can never scroll to a
  // file that sits somewhere else in the list.
  const orderedFiles = useMemo(() => orderFiles(files), [files]);
+ /** The pick only ever names files of the revision on screen, so a path left
+  *  over from another revision falls out of the selection on its own. */
+ const checkedFiles = useMemo(
+  () => new Set(orderedFiles.map((file) => file.path).filter((path) => checkedPaths.has(path))),
+  [orderedFiles, checkedPaths],
+ );
+ const allFilesChecked =
+  orderedFiles.length > 0 && orderedFiles.every((file) => checkedPaths.has(file.path));
  const fileTree = useMemo(() => buildFileTree(files, collapsedFolders), [files, collapsedFolders]);
  const { rows, fileRowIndex } = useMemo(() => buildRows(orderedFiles, split), [orderedFiles, split]);
  const revisionOptions = useMemo(
@@ -415,12 +426,52 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
   });
  }, [fileTree.folderPaths]);
 
+ const toggleChecked = useCallback((path: string) => {
+  setCheckedPaths((current) => {
+   const next = new Set(current);
+   if (next.has(path)) next.delete(path);
+   else next.add(path);
+   return next;
+  });
+ }, []);
+
+ const toggleCheckAll = useCallback(() => {
+  setCheckedPaths(
+   allFilesChecked ? new Set() : new Set(orderedFiles.map((file) => file.path)),
+  );
+ }, [allFilesChecked, orderedFiles]);
+
+ /** Picked files still need somewhere to go, which is what the picker answers. */
+ const askWhereCheckedGo = useCallback(() => {
+  if (checkedFiles.size > 0) setPicker("squash-files");
+ }, [checkedFiles]);
+
  /** A pick means whatever the picker was opened for: a revision to read, a
-  *  second parent to merge, or a destination to rebase onto. */
+  *  second parent to merge, a destination to rebase onto, or the revision the
+  *  picked files move into. */
  const pickRevision = useCallback(
   (id: string) => {
    const purpose = picker;
    setPicker(null);
+   if (purpose === "squash-files") {
+    runAction.mutate(
+     {
+      directory: directory ?? "",
+      action: "squash",
+      revset: selectedChangeId ?? undefined,
+      target: id,
+      paths: [...checkedFiles],
+     },
+     // The pick is only spent once jj took it: a destination it refuses leaves
+     // the selection standing, ready for another try.
+     {
+      onSuccess: (result) => {
+       if (result.ok) setCheckedPaths(new Set());
+      },
+     },
+    );
+    return;
+   }
    if (purpose === "merge" || purpose === "rebase" || purpose === "squash") {
     runAction.mutate({
      directory: directory ?? "",
@@ -433,7 +484,7 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
    setRevset(id);
    setSelectedPath(null);
   },
-  [directory, picker, runAction, selectedChangeId],
+  [checkedFiles, directory, picker, runAction, selectedChangeId],
  );
 
  const setBookmark = useCallback(() => {
@@ -812,6 +863,12 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
        rows={fileTree.rows}
        collapsed={collapsedFolders}
        selectedPath={selectedPath}
+       checked={checkedFiles}
+       allChecked={allFilesChecked}
+       busy={busy}
+       onToggleChecked={toggleChecked}
+       onToggleCheckAll={toggleCheckAll}
+       onSquashChecked={askWhereCheckedGo}
        allCollapsed={allCollapsed}
        loading={diffQuery.isPending}
        flex={filesFlex}
