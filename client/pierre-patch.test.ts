@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import type { JjDiffHunk, JjFileDiff } from "../shared/contracts";
-import { filePatch, noteFor } from "./pierre-patch";
+import { filePatch, noteFor, wholeFileText } from "./pierre-patch";
 
 const line = (kind: "add" | "remove" | "context", text: string) => ({
  kind,
@@ -114,5 +114,33 @@ assert.equal(noteFor(ADDED), null);
 assert.equal(noteFor(RENAMED), "Renamed with no content change.");
 assert.equal(noteFor(BINARY), "Binary file — no text diff.");
 assert.equal(noteFor({ ...MODIFIED, hunks: [] }), "No content changes.");
+
+/**
+ * The text an edit writes back comes from the whole-file read. It has to be the
+ * file byte for byte, because the server checks the write against it.
+ */
+const wholeFile = {
+ ...ADDED,
+ path: "docs/readme.md",
+ hunks: [
+  hunk("@@ -0,0 +1,3 @@", 0, 1, [
+   { ...line("add", "first line"), newLine: 1 },
+   { ...line("add", "second line"), newLine: 2 },
+   { ...line("add", "third line"), newLine: 3 },
+  ]),
+ ],
+};
+assert.equal(wholeFileText([wholeFile]), "first line\nsecond line\nthird line\n", "tokens rejoin into the file's text");
+assert.equal(wholeFileText([]), null, "no file in the read means no text");
+assert.equal(wholeFileText([ADDED, REMOVED]), null, "a read of more than one file is not a file");
+assert.equal(wholeFileText([BINARY]), null, "a binary file has no text to read");
+assert.equal(wholeFileText([{ ...wholeFile, hunks: [] }]), "", "an empty file reads as empty text");
+assert.equal(
+ wholeFileText([
+  { ...wholeFile, hunks: [hunk("@@ -1,2 +1,2 @@", 1, 1, [line("context", "kept"), { ...line("add", "added"), newLine: 2 }])] },
+ ]),
+ null,
+ "a partial diff is not the whole file",
+);
 
 console.log("client/pierre-patch.test.ts: all assertions passed");

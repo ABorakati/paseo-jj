@@ -5,5 +5,12 @@
  */
 export { parsePatchFiles } from "@pierre/diffs";
 export type { FileDiffMetadata } from "@pierre/diffs";
-export { CodeView } from "@pierre/diffs/react";
+export { CodeView, EditProvider } from "@pierre/diffs/react";
 export type { CodeViewHandle, CodeViewItem } from "@pierre/diffs/react";
+export { Editor } from "@pierre/diffs/edit";
+export type {
+ EditCompletionDecision,
+ EditorFactory,
+ FileEditCompleteEvent,
+ FileDiffEditCompleteEvent,
+} from "@pierre/diffs/edit";

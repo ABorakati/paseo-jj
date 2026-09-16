@@ -51,3 +51,20 @@ export function noteFor(file: JjFileDiff): string | null {
  if (file.hunks.length > 0) return null;
  return file.status === "renamed" ? "Renamed with no content change." : "No content changes.";
 }
+
+/**
+ * One file's text, recovered from the diff that reads the whole file: a range
+ * from the empty root revision to the revision being read shows every line as an
+ * addition, so the new side is the file. Returns null when the diff does not
+ * describe exactly one text file, which is how a missing path and a binary file
+ * are told apart from an empty one.
+ */
+export function wholeFileText(files: JjFileDiff[]): string | null {
+ if (files.length !== 1) return null;
+ const file = files[0];
+ if (file.binary) return null;
+ const rows = file.hunks.flatMap((hunk) => hunk.lines);
+ if (rows.some((row) => row.kind !== "add")) return null;
+ if (rows.length === 0) return "";
+ return `${rows.map((row) => row.tokens.map((token) => token.t).join("")).join("\n")}\n`;
+}

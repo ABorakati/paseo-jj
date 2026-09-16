@@ -6,7 +6,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Pressable, Text, TextInput, View } from "react-native";
 import type { PointerEvent, ViewStyle } from "react-native";
-import { actionRpc, diffRpc, snapshotRpc } from "../shared/contracts";
+import { actionRpc, diffRpc, snapshotRpc, writeFileRpc } from "../shared/contracts";
 import { monoFont } from "./diff-view";
 import { buildFileTree, orderFiles } from "./file-tree";
 import { FileTreeRail } from "./file-tree-rail";
@@ -23,7 +23,8 @@ import {
 import { GraphView } from "./graph-view";
 import { useHeldKeys } from "./held-keys";
 import { buildPalette } from "./palette";
-import { PierreDiffView, type HunkActionInput, type PierreDiffHandle } from "./pierre-diff";
+import { PierreDiffView, type HunkActionInput, type PierreDiffHandle, type FileEditAccess } from "./pierre-diff";
+import { wholeFileText } from "./pierre-patch";
 import {
  SIDEBAR_INITIAL_WIDTH,
  SPLIT_INITIAL,
@@ -170,6 +171,7 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
  const callSnapshot = useRpc(snapshotRpc);
  const callDiff = useRpc(diffRpc);
  const callAction = useRpc(actionRpc);
+ const callWriteFile = useRpc(writeFileRpc);
  const toast = useToast();
  const queryClient = useQueryClient();
  const diffRef = useRef<PierreDiffHandle>(null);
@@ -503,7 +505,10 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
 
  const styles = useMemo(
   () => ({
-   screen: { flex: 1, backgroundColor: theme.colors.surface0 },
+   /** `minHeight: 0` is what lets the pane be bounded by its host at all: a flex
+   *  item's automatic minimum size is its content, so without this the diff
+   *  makes the panel taller than the space it was given and nothing scrolls. */
+   screen: { flex: 1, minHeight: 0, backgroundColor: theme.colors.surface0 },
    header: { paddingHorizontal: layout.compact ? 12 : 16, paddingTop: 12, paddingBottom: 6, gap: 6 },
    row: { flexDirection: "row" as const, alignItems: "center" as const, gap: 6 },
    changeId: { color: palette.filePathMuted, fontSize: metrics.fontSize, fontFamily: metrics.fontFamily },
@@ -661,6 +666,48 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
   },
   [revset, squashHunks, toast],
  );
+
+ /**
+  * An inline edit needs the file's text, and the diff only carries hunks: the
+  * panel reads both sides from the range that starts at the empty root revision,
+  * where every line of the file arrives as an addition. `expected` is that same
+  * text, so the server refuses a write built on a read an agent has since made
+  * stale instead of overwriting their work.
+  */
+ const editAccess = useMemo<FileEditAccess | undefined>(() => {
+  if (revset !== "@") return undefined;
+  return {
+   async read(path: string) {
+    const [current, parent] = await Promise.all([
+     callDiff({ directory: directory ?? "", revset: "root()..@", path }),
+     callDiff({ directory: directory ?? "", revset: "root()..@-", path }),
+    ]);
+    const newText = wholeFileText(current.files);
+    if (newText === null) {
+     throw new Error(current.error ?? `The panel could not read ${path}.`);
+    }
+    return { oldText: wholeFileText(parent.files) ?? "", newText };
+   },
+   async write({ path, content, expected }) {
+    const result = await callWriteFile({ directory: directory ?? "", path, content, expected });
+    if (result.ok) {
+     toast.show(`Wrote ${path}`, { variant: "success" });
+    } else {
+     // The server's own words, which name what went wrong and leave the file
+     // alone: a stale read, a path outside the workspace, a file too large.
+     toast.error(result.error ?? "The write was refused.");
+    }
+    // jj snapshots the working copy on its next command, so the diff is re-read
+    // either way: on a write it shows the edit, on a refusal it shows the file
+    // as it really is.
+    await Promise.all([
+     queryClient.invalidateQueries({ queryKey: ["jj", "snapshot"] }),
+     queryClient.invalidateQueries({ queryKey: ["jj", "diff"] }),
+    ]);
+    return result;
+   },
+  };
+ }, [callDiff, callWriteFile, directory, queryClient, revset, toast]);
 
  const selectFile = useCallback(
   (path: string) => {
@@ -1130,6 +1177,7 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
       palette={palette}
       onRevertFile={revset === "@" ? setPendingRevert : undefined}
       onHunkAction={onHunkAction}
+      edit={editAccess}
       handleRef={diffRef}
      />
     )}
