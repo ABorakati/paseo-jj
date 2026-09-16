@@ -193,6 +193,92 @@ async function main(): Promise<void> {
   const rebased = await action({ directory: root, action: "rebase", revset: merge, target: base });
   assert.equal(rebased.ok, true, rebased.error ?? "");
 
+  // --- the drop gestures' verbs -----------------------------------------
+  // A drag asks for two things the plain verbs cannot express: `-r` moves one
+  // revision and leaves the rest of its branch behind, where the plain rebase
+  // takes the branch along, and `--onto` leaves the source's changes on top of
+  // the destination as a new revision where `--into` folds them into it.
+  const graft = (name: string, rev: string) => {
+   jj("new", rev, "-m", name);
+   writeFileSync(join(root, `${name}.txt`), `${name}\n`);
+   return idOf("@");
+  };
+  const parentId = (rev: string) =>
+   jj("log", "--no-graph", "-r", `${rev}-`, "-T", "change_id").trim();
+
+  const destination = graft("gesture destination", "root()");
+  const branchBase = graft("gesture base", "root()");
+  const moves = graft("moves alone", branchBase);
+  const follows = graft("follows along", moves);
+
+  const movedAlone = await action({
+   directory: root,
+   action: "rebase-revision",
+   revset: moves,
+   target: destination,
+  });
+  assert.equal(movedAlone.ok, true, movedAlone.error ?? "");
+  assert.equal(parentId(moves), destination, "the revision lands on the destination");
+  assert.equal(parentId(follows), branchBase, "and the rest of its branch stays behind");
+
+  const source = graft("onto source", branchBase);
+  const onto = graft("onto destination", "root()");
+  const squashedOnto = await action({
+   directory: root,
+   action: "squash-onto",
+   revset: source,
+   target: onto,
+  });
+  assert.equal(squashedOnto.ok, true, squashedOnto.error ?? "");
+  const createdRevision = jj("log", "--no-graph", "-r", `children(${onto})`, "-T", "change_id").trim();
+  assert.notEqual(createdRevision, "", "the changes come back as a new revision");
+  assert.equal(parentId(createdRevision), onto, "the new revision sits on the destination");
+  const createdDiff = await diff({ directory: root, revset: createdRevision });
+  assert.ok(
+   createdDiff.files.some((file) => file.path === "onto source.txt"),
+   "and it carries the dragged changes",
+  );
+
+  // --- the bulk plan -----------------------------------------------------
+  // The panel passes a selection as one union revset wherever jj accepts one,
+  // and runs the verb once per revision where it does not.
+  const droppedOne = graft("drop one", destination);
+  const droppedTwo = graft("drop two", destination);
+  const bulkAbandon = await action({
+   directory: root,
+   action: "abandon",
+   revset: `${droppedOne} | ${droppedTwo}`,
+  });
+  assert.equal(bulkAbandon.ok, true, bulkAbandon.error ?? "");
+  const remaining = jj("log", "--no-graph", "-r", "all()", "-T", "change_id").trim();
+  assert.ok(
+   !remaining.includes(droppedOne) && !remaining.includes(droppedTwo),
+   "one command abandons the whole selection",
+  );
+
+  const movedOne = graft("move one", "root()");
+  const movedTwo = graft("move two", "root()");
+  const bulkRebase = await action({
+   directory: root,
+   action: "rebase",
+   revset: `${movedOne} | ${movedTwo}`,
+   target: branchBase,
+  });
+  assert.equal(bulkRebase.ok, true, bulkRebase.error ?? "");
+  assert.equal(parentId(movedOne), branchBase, "the first revision of the union moved in one command");
+  assert.equal(parentId(movedTwo), branchBase, "and the second moved with it");
+
+  const squashOne = graft("squash one", branchBase);
+  const squashTwo = graft("squash two", squashOne);
+  const bulkSquash = await action({
+   directory: root,
+   action: "squash",
+   revset: `${squashOne} | ${squashTwo}`,
+  });
+  assert.equal(bulkSquash.ok, false, "jj refuses a squash of two revisions at once");
+  const oneAtATime = await action({ directory: root, action: "squash", revset: squashTwo });
+  assert.equal(oneAtATime.ok, true, oneAtATime.error ?? "");
+
   const rejected = await action({
    directory: root,
    action: "bookmark-delete",

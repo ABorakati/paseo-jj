@@ -402,6 +402,22 @@ export async function action({
    args = bookmark ? ["git", "push", "--bookmark", bookmark] : ["git", "push", "--tracked"];
    break;
   }
+  case "rebase-revision": {
+   const destination = target ? safeArg(target) : null;
+   if (!destination) return { ok: false, error: "Pick a destination revision.", output: "" };
+   // `-r` moves this revision alone and leaves its descendants on the parent it
+   // came from; the plain rebase's `-b` would take the whole branch along.
+   args = ["rebase", "-r", revision ?? "@", "-d", destination];
+   break;
+  }
+  case "squash-onto": {
+   const onto = target ? safeArg(target) : null;
+   if (!onto) return { ok: false, error: "Pick a revision to squash onto.", output: "" };
+   // `--onto` applies the source's changes on top of the destination as a new
+   // revision, where `--into` would fold them into the destination itself.
+   args = ["squash", "--from", revision ?? "@", "--onto", onto];
+   break;
+  }
   default:
    return { ok: false, error: "Unsupported action.", output: "" };
  }

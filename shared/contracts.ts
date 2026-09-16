@@ -162,6 +162,12 @@ export const ACTION_IDS = [
  "merge",
  "rebase",
  "push",
+ /** Rebase one revision rather than the branch that holds it. The drop that
+  *  carries `R` needs jj's `-r`, which the plain rebase cannot ask for. */
+ "rebase-revision",
+ /** Squash onto a revision instead of into it: jj leaves the source's changes
+  *  on top of the destination as a new revision, which `--into` does not do. */
+ "squash-onto",
 ] as const;
 
 export type JjActionId = (typeof ACTION_IDS)[number];

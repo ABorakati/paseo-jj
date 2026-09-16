@@ -1,3 +1,4 @@
+import type { RpcInput, RpcOutput } from "@getpaseo/plugin";
 import type { PluginWorkspacePanelProps } from "@getpaseo/plugin/client";
 import { useRpc, useWorkspace } from "@getpaseo/plugin/client";
 import { Icon, copyText, useToast } from "@getpaseo/plugin/client/react-native";
@@ -9,7 +10,18 @@ import { actionRpc, diffRpc, snapshotRpc } from "../shared/contracts";
 import { FileHeader, HunkHeader, NoteRow, SplitLine, UnifiedLine, monoFont } from "./diff-view";
 import { buildFileTree, orderFiles } from "./file-tree";
 import { FileTreeRail } from "./file-tree-rail";
+import {
+ DROP_LABELS,
+ actionTargets,
+ bulkRevsets,
+ clickedSelection,
+ dropCall,
+ dropGesture,
+ type BulkVerb,
+ type HeldModifiers,
+} from "./gestures";
 import { GraphView } from "./graph-view";
+import { useHeldKeys } from "./held-keys";
 import { buildPalette } from "./palette";
 import {
  SIDEBAR_INITIAL_WIDTH,
@@ -87,6 +99,66 @@ const REVISION_ACTIONS: RevisionAction[] = [
  },
 ];
 
+/** The verbs a set of rows can run. jj takes the whole selection in one command
+ *  for abandon and rebase; a squash goes one revision at a time, which is why
+ *  the confirm question says so. */
+const bulkVerbActions = (count: number): RevisionAction[] => [
+ {
+  id: "abandon",
+  label: `Abandon ${count} revisions`,
+  hint: "drop every one of them, and their descendants",
+  confirm: `Abandon ${count} revisions? Their descendants move to their parents.`,
+ },
+ {
+  id: "squash",
+  label: "Squash into parent",
+  hint: "fold each one into the revision below it",
+  confirm: `Squash ${count} revisions into their parents, one command each? One that empties out is abandoned.`,
+ },
+ { id: "rebase", label: "Rebase onto…", hint: "move the selected branches onto another revision" },
+];
+
+/** How the panel names each bulk verb in the report it shows afterwards. */
+const BULK_VERB_LABELS: Record<BulkVerb, string> = {
+ abandon: "Abandon",
+ squash: "Squash into parent",
+ rebase: "Rebase onto",
+};
+
+/** A drag has to be a drag: below this the press is the click that selects the
+ *  row, and swallowing it would leave the diff unable to follow the graph. */
+const DRAG_THRESHOLD = 4;
+
+const EMPTY_SELECTION: ReadonlySet<string> = new Set();
+
+/**
+ * The pointer reports where it is in viewport coordinates, so the drag HUD is
+ * pinned the same way; the panel's own box would offset it, and on a native host
+ * `fixed` is not a position that exists, which is why the stylesheet carries an
+ * `absolute` fallback under it.
+ */
+const DRAG_HUD_FIXED = { position: "fixed" } as unknown as ViewStyle;
+
+/** The live drag, in the closure that ends it: the row picked up, the row the
+ *  pointer is over, and whether it has moved far enough to be a drag at all. */
+interface DragControl {
+ changeId: string;
+ bookmark: string | null;
+ startX: number;
+ startY: number;
+ active: boolean;
+ targetId: string | null;
+}
+
+/** The part of a live drag the panel draws from. */
+interface DragVisual {
+ draggedId: string;
+ targetId: string | null;
+ bookmark: string | null;
+ x: number;
+ y: number;
+}
+
 export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePanelProps) {
  const workspace = useWorkspace(workspaceId, (snapshot) => ({
   directory: snapshot.directory,
@@ -108,6 +180,10 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
  const [message, setMessage] = useState("");
  const [pendingRevert, setPendingRevert] = useState<string | null>(null);
  const [picker, setPicker] = useState<RevisionPickerPurpose | null>(null);
+ /** The revisions a pick from the picker acts on when the picker was opened
+  *  from a bulk verb: it cannot carry a list, and Escape may empty the
+  *  selection while it is up, which must not quietly narrow the verb. */
+ const [pickerTargets, setPickerTargets] = useState<string[] | null>(null);
  const [bookmarkName, setBookmarkName] = useState("");
  const [pendingBookmarkDelete, setPendingBookmarkDelete] = useState<string | null>(null);
  const [collapsedFolders, setCollapsedFolders] = useState<ReadonlySet<string>>(new Set());
@@ -120,6 +196,31 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
  /** Paths picked in the tree, for a move into another revision. */
  const [checkedPaths, setCheckedPaths] = useState<ReadonlySet<string>>(new Set());
  const [actionsOpen, setActionsOpen] = useState(false);
+ /** The rows gathered with ctrl/cmd-click, which the bulk verbs act on. */
+ const [selection, setSelection] = useState<ReadonlySet<string>>(EMPTY_SELECTION);
+ /** The live drag as the panel draws it: which row is picked up, which row the
+  *  pointer is over, and where the pointer is, for the HUD. */
+ const [drag, setDrag] = useState<DragVisual | null>(null);
+ /** The same drag where it is ended from. It carries the press's starting
+  *  point, so a move that has not passed the drag threshold changes nothing on
+  *  screen: a click that nudges the pointer by a pixel is still a click. */
+ const dragRef = useRef<DragControl | null>(null);
+ /** A press that arrives just after a drop is that drag's tail, not a click on
+  *  the row it happened to land on. */
+ const suppressSelect = useRef(false);
+
+ /** Escape is the reader's way out of a selection, so it is the keyboard's only
+  *  job here; the panel clears the set and leaves the diff's revision alone. */
+ const clearSelection = useCallback(() => setSelection(EMPTY_SELECTION), []);
+
+ /**
+  * The modifier keys held right now. They come from the keyboard rather than
+  * from the pointer because react-native's `PointerEvent` carries no
+  * `ctrlKey`/`shiftKey`/`metaKey`, and only a browser has the window to read
+  * them from: on any other host the panel holds no modifiers, so a drag falls
+  * back to the action its no-modifier case names.
+  */
+ const held = useHeldKeys(layout.platform === "web", clearSelection);
 
  /** A drag is measured against the size at the moment the press happened. */
  const sidebarWidthRef = useRef(sidebarWidth);
@@ -139,11 +240,37 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
   * handle itself. Pointer events bubble, so a move anywhere in the pane reaches
   * these handlers — which matters because the handle shifts under the cursor as
   * the sidebar resizes, and a gesture tied to a 6px strip cannot follow it.
+  *
+  * A dragged revision row rides the same handler: the rows live in a scrolling
+  * list and the pointer leaves them as soon as it moves on, so the pane is what
+  * keeps reporting where the pointer is.
   */
  const onDragMove = (event: PointerEvent) => {
+  const { pageX, pageY } = event.nativeEvent;
+  const revision = dragRef.current;
+  if (revision) {
+   if (!revision.active) {
+    const moved =
+     Math.abs(pageX - revision.startX) >= DRAG_THRESHOLD ||
+     Math.abs(pageY - revision.startY) >= DRAG_THRESHOLD;
+    if (!moved) return;
+    revision.active = true;
+    setDrag({
+     draggedId: revision.changeId,
+     targetId: revision.targetId,
+     bookmark: revision.bookmark,
+     x: pageX,
+     y: pageY,
+    });
+    return;
+   }
+   setDrag((current) => (current ? { ...current, x: pageX, y: pageY } : current));
+   return;
+  }
+
   const sidebar = sidebarDrag.current;
   if (sidebar) {
-   const deltaX = event.nativeEvent.pageX - sidebar.startX;
+   const deltaX = pageX - sidebar.startX;
    if (Math.abs(deltaX) >= 2) {
     setSidebarWidth(draggedSidebarWidth(sidebar.startWidth, deltaX));
    }
@@ -151,7 +278,7 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
   }
   const split = splitDrag.current;
   if (split) {
-   const deltaY = event.nativeEvent.pageY - split.startY;
+   const deltaY = pageY - split.startY;
    if (Math.abs(deltaY) >= 2) {
     setSplitRatio(draggedSplitRatio(split.startRatio, deltaY, sidebarHeightRef.current));
    }
@@ -161,7 +288,63 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
  const endDrag = () => {
   sidebarDrag.current = null;
   splitDrag.current = null;
+  const revision = dragRef.current;
+  dragRef.current = null;
+  if (!revision) return;
+  setDrag(null);
+  // Below the threshold nothing was dragged, so the press stays the click the
+  // row's own handler turns into a selection.
+  if (!revision.active) return;
+  suppressSelect.current = true;
+  const target = revision.targetId;
+  if (target === null || target === revision.changeId) return;
+  if (revision.bookmark !== null) {
+   // A bookmark pill dropped on a row is the one drop that moves a name rather
+   // than history, so it takes the same verb the bookmark field does.
+   runAction.mutate({
+    directory: directory ?? "",
+    action: "bookmark-set",
+    name: revision.bookmark,
+    revset: target,
+   });
+   return;
+  }
+  runAction.mutate({
+   directory: directory ?? "",
+   ...dropCall(dropGesture(held), revision.changeId, target),
+  });
  };
+
+ /** A press that may become a drag: the row it started on, the bookmark when it
+  *  started on a pill, and where the pointer was. */
+ const startDrag = useCallback(
+  (changeId: string, bookmark: string | null, pageX: number, pageY: number) => {
+   // A press on a bookmark pill reaches the pill first and the row second, and
+   // the panel must keep the narrower of the two: a pill being dragged moves the
+   // bookmark, so the row it sits on must not take the gesture over. A press on
+   // another row is a new gesture and replaces the stale one.
+   const current = dragRef.current;
+   if (
+    current !== null &&
+    current.changeId === changeId &&
+    current.bookmark !== null &&
+    bookmark === null
+   ) {
+    return;
+   }
+   dragRef.current = { changeId, bookmark, startX: pageX, startY: pageY, active: false, targetId: null };
+   suppressSelect.current = false;
+  },
+  [],
+ );
+
+ /** The pointer is over a row while a drag is live: it is where the drop lands. */
+ const onDragOver = useCallback((changeId: string) => {
+  const revision = dragRef.current;
+  if (revision === null || !revision.active || revision.targetId === changeId) return;
+  revision.targetId = changeId;
+  setDrag((current) => (current === null ? current : { ...current, targetId: changeId }));
+ }, []);
  const palette = useMemo(() => buildPalette(theme), [theme]);
  const metrics = useMemo(
   () => ({ fontSize: layout.compact ? 11 : 12, fontFamily: monoFont(layout.platform) }),
@@ -193,6 +376,45 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
    toast.show(result.output || "Done", { variant: "success" });
    setMessage("");
    setPendingRevert(null);
+   await Promise.all([
+    queryClient.invalidateQueries({ queryKey: ["jj", "snapshot"] }),
+    queryClient.invalidateQueries({ queryKey: ["jj", "diff"] }),
+   ]);
+  },
+  onError: (error: unknown) => {
+   toast.error(error instanceof Error ? error.message : "The daemon call failed.");
+  },
+ });
+
+ /**
+  * A bulk verb is one daemon call per command in its plan. The calls run in
+  * order rather than together: a squash of three rows folds the second one into
+  * the tree the first one left, and when one of them fails the report has to say
+  * which revision it was.
+  */
+ const bulkAction = useMutation({
+  mutationFn: async (variables: {
+   verb: BulkVerb;
+   count: number;
+   calls: Array<RpcInput<typeof actionRpc>>;
+  }) => {
+   const results: Array<RpcOutput<typeof actionRpc>> = [];
+   for (const call of variables.calls) results.push(await callAction(call));
+   return results;
+  },
+  onSuccess: async (results, variables) => {
+   const failures = results.filter((result) => !result.ok);
+   const done = results.length - failures.length;
+   if (done > 0) {
+    toast.show(`${BULK_VERB_LABELS[variables.verb]}: ${done} of ${variables.count} done`, {
+     variant: "success",
+    });
+   }
+   for (const failure of failures) toast.error(failure.error ?? "jj command failed.");
+   // The rows have just been rewritten: one may be gone and another may have
+   // emptied out, so leaving them selected would aim the next verb at revisions
+   // that are no longer the ones the reader picked.
+   setSelection(EMPTY_SELECTION);
    await Promise.all([
     queryClient.invalidateQueries({ queryKey: ["jj", "snapshot"] }),
     queryClient.invalidateQueries({ queryKey: ["jj", "diff"] }),
@@ -244,6 +466,14 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
    : revset === "@-"
     ? (snapshot?.parent?.changeId ?? null)
     : revset;
+ /** The revisions the next verb acts on: the rows gathered with ctrl-click, or
+  *  the one the diff is reading when nothing is gathered. More than one is what
+  *  turns the actions list into the bulk one. */
+ const targets = useMemo(
+  () => actionTargets(selection, selectedChangeId),
+  [selection, selectedChangeId],
+ );
+ const bulk = targets.length > 1;
  const allCollapsed =
   fileTree.folderPaths.length > 0 &&
   fileTree.folderPaths.every((path) => collapsedFolders.has(path));
@@ -258,6 +488,12 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
   // row that would silently fall back to the tracked set is left out.
   return REVISION_ACTIONS.filter((action) => action.id !== "push");
  }, [bookmarkName]);
+ /** What the overlay lists: the verbs for a whole selection once more than one
+  *  row is gathered, the one revision's verbs otherwise. */
+ const overlayActions = useMemo(
+  () => (bulk ? bulkVerbActions(targets.length) : actions),
+  [actions, bulk, targets.length],
+ );
 
  const resizeCursor = layout.platform === "web" ? WIDTH_HANDLE : undefined;
  const splitCursor = layout.platform === "web" ? HEIGHT_HANDLE : undefined;
@@ -374,6 +610,19 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
     borderTopWidth: 1,
     borderColor: palette.splitDivider,
    },
+   /** The drag HUD. It follows the pointer in viewport coordinates, which only
+    *  the web host can express, so this is the fallback position and the web
+    *  one is layered over it at the render site. */
+   dragHud: {
+    position: "absolute" as const,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    backgroundColor: theme.colors.surface2,
+    borderWidth: 1,
+    borderColor: theme.colors.accent,
+   },
+   dragHudText: { color: palette.filePath, fontSize: metrics.fontSize },
   }),
   [palette, theme, metrics, layout.compact],
  );
@@ -399,14 +648,19 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
  );
 
  /** The sidebar selects the revision the diff reads; on a narrow pane that is
-  *  the whole errand, so it hands the pane back to the diff. */
+  *  the whole errand, so it hands the pane back to the diff. Ctrl/cmd-click adds
+  *  the row to the selection instead of moving the diff to it. */
  const selectRevision = useCallback(
   (changeId: string) => {
+   // The press that ends a drag lands on a row as well. It is the tail of a
+   // gesture that has already run its verb, not a request to read that revision.
+   if (suppressSelect.current) return;
    setRevset(changeId);
    setSelectedPath(null);
+   setSelection((current) => clickedSelection(current, changeId, held.additive));
    if (layout.compact) setTreeVisible(false);
   },
-  [layout.compact],
+  [held.additive, layout.compact],
  );
 
  const toggleFolder = useCallback((path: string) => {
@@ -426,29 +680,55 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
   });
  }, [fileTree.folderPaths]);
 
- const toggleChecked = useCallback((path: string) => {
-  setCheckedPaths((current) => {
-   const next = new Set(current);
-   if (next.has(path)) next.delete(path);
-   else next.add(path);
-   return next;
-  });
- }, []);
+const toggleChecked = useCallback((path: string) => {
+ setCheckedPaths((current) => {
+  const next = new Set(current);
+  if (next.has(path)) next.delete(path);
+  else next.add(path);
+  return next;
+ });
+}, []);
 
- const toggleCheckAll = useCallback(() => {
-  setCheckedPaths(
-   allFilesChecked ? new Set() : new Set(orderedFiles.map((file) => file.path)),
-  );
- }, [allFilesChecked, orderedFiles]);
+const toggleCheckAll = useCallback(() => {
+ setCheckedPaths(
+  allFilesChecked ? new Set() : new Set(orderedFiles.map((file) => file.path)),
+ );
+}, [allFilesChecked, orderedFiles]);
 
- /** Picked files still need somewhere to go, which is what the picker answers. */
- const askWhereCheckedGo = useCallback(() => {
-  if (checkedFiles.size > 0) setPicker("squash-files");
- }, [checkedFiles]);
+/** Picked files still need somewhere to go, which is what the picker answers. */
+const askWhereCheckedGo = useCallback(() => {
+ if (checkedFiles.size > 0) setPicker("squash-files");
+}, [checkedFiles]);
+
+ /**
+  * Runs a bulk verb over the revisions the reader gathered. The plan says how
+  * many commands that is — one for abandon and rebase, one per revision for a
+  * squash — and the calls go in the order the rows were picked.
+  */
+ const runBulk = useCallback(
+  (verb: BulkVerb, revs: string[], destination?: string) => {
+   const revsets = bulkRevsets(verb, revs);
+   if (revsets.length === 0) return;
+   setActionsOpen(false);
+   bulkAction.mutate({
+    verb,
+    count: revs.length,
+    calls: revsets.map((revset) => ({
+     directory: directory ?? "",
+     action: verb,
+     revset,
+     target: destination,
+    })),
+   });
+  },
+  [bulkAction, directory],
+ );
 
  /** A pick means whatever the picker was opened for: a revision to read, a
-  *  second parent to merge, a destination to rebase onto, or the revision the
-  *  picked files move into. */
+ /** A pick means whatever the picker was opened for: a revision to read, a
+  *  second parent to merge, a destination to rebase onto, the revision the
+  *  picked files move into, or — when it was opened from a bulk verb — the
+  *  destination for a whole selection. */
  const pickRevision = useCallback(
   (id: string) => {
    const purpose = picker;
@@ -473,6 +753,14 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
     return;
    }
    if (purpose === "merge" || purpose === "rebase" || purpose === "squash") {
+    // The picker can only carry one value, so the selection it was opened for
+    // waits here; a pick arriving without one is the single-revision verb.
+    const revs = pickerTargets;
+    setPickerTargets(null);
+    if (revs !== null) {
+     runBulk("rebase", revs, id);
+     return;
+    }
     runAction.mutate({
      directory: directory ?? "",
      action: purpose,
@@ -484,7 +772,7 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
    setRevset(id);
    setSelectedPath(null);
   },
-  [checkedFiles, directory, picker, runAction, selectedChangeId],
+  [checkedFiles, directory, picker, pickerTargets, runAction, runBulk, selectedChangeId],
  );
 
  const setBookmark = useCallback(() => {
@@ -548,6 +836,21 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
    }
   },
   [bookmarkName, directory, message, runAction, selectedChangeId],
+ );
+
+ /** Runs one verb from the bulk list. The two that act where they are go at
+   *  once; a rebase needs a destination, so it hands the selection to the
+   *  picker and comes back when there is one. */
+ const runBulkAction = useCallback(
+  (id: RevisionActionId) => {
+   if (id === "rebase") {
+    setPickerTargets(targets);
+    setPicker("rebase");
+    return;
+   }
+   if (id === "abandon" || id === "squash") runBulk(id, targets);
+  },
+  [runBulk, targets],
  );
 
  const renderRow = useCallback(
@@ -624,7 +927,16 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
  const current = snapshot.current;
  const isEmpty = current?.empty ?? true;
  const canCommit = !runAction.isPending && message.trim().length > 0;
- const busy = runAction.isPending;
+ const busy = runAction.isPending || bulkAction.isPending;
+ /** The HUD's words: the verb the held keys chose, and what it would act on.
+  *  The target is still unknown until the pointer is over a row, which is what
+  *  the ellipsis says. */
+ const dragLabel =
+  drag === null
+   ? ""
+   : drag.bookmark === null
+    ? DROP_LABELS[dropGesture(held)]
+    : `Move bookmark ${drag.bookmark} to`;
 
  return (
   <View style={styles.screen}>
@@ -902,11 +1214,15 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
        changes={snapshot?.graph ?? []}
        selectedChangeId={selectedChangeId}
        currentChangeId={snapshot?.current?.changeId ?? null}
+       selection={selection}
+       drag={drag}
        loading={snapshotQuery.isPending}
        flex={revisionsFlex}
        minimized={revisionsMinimized}
        onToggleMinimized={() => setRevisionsMinimized((value) => !value)}
        onSelect={selectRevision}
+       onDragStart={startDrag}
+       onDragOver={onDragOver}
        onOpenActions={() => setActionsOpen(true)}
        palette={palette}
        metrics={metrics}
@@ -1006,7 +1322,10 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
      options={revisionOptions}
      value={revset}
      onSelect={pickRevision}
-     onClose={() => setPicker(null)}
+     onClose={() => {
+      setPicker(null);
+      setPickerTargets(null);
+     }}
      palette={palette}
      theme={theme}
      metrics={metrics}
@@ -1016,16 +1335,35 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
 
    {actionsOpen ? (
     <RevisionActionsOverlay
-     selectionLabel={revisionName}
-     actions={actions}
-     onRun={runRevisionAction}
+     selectionLabel={bulk ? `${targets.length} revisions` : revisionName}
+     actions={overlayActions}
+     onRun={bulk ? runBulkAction : runRevisionAction}
      onClose={() => setActionsOpen(false)}
      busy={busy}
+     bulk={bulk}
      palette={palette}
      metrics={metrics}
      theme={theme}
      compact={layout.compact}
     />
+   ) : null}
+
+   {drag ? (
+    <View
+     // The HUD sits under the pointer, which is where the drop is: it must not
+     // take the pointer's place, or the row it names could never be reached.
+     pointerEvents="none"
+     accessibilityLabel="Drag action"
+     style={[
+      styles.dragHud,
+      layout.platform === "web" ? DRAG_HUD_FIXED : null,
+      { left: drag.x + 14, top: drag.y + 14 },
+     ]}
+    >
+     <Text style={styles.dragHudText} numberOfLines={1}>
+      {dragLabel} {drag.targetId === null ? "…" : drag.targetId.slice(0, 8)}
+     </Text>
+    </View>
    ) : null}
   </View>
  );

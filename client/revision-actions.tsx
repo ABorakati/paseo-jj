@@ -30,6 +30,9 @@ interface RevisionActionsOverlayProps {
  onRun(id: string): void;
  onClose(): void;
  busy: boolean;
+ /** True when the list holds the verbs for a whole selection: the same list
+  *  then reads as one that acts on several revisions, not on one. */
+ bulk: boolean;
  palette: DiffPalette;
  metrics: Metrics;
  theme: PluginTheme;
@@ -42,6 +45,9 @@ interface RevisionActionsOverlayProps {
  * They live here rather than as buttons in the sidebar because there are a
  * dozen of them and each one rewrites something: a rail-wide row of unlabeled
  * icons would hide both the verbs and their consequences.
+ *
+ * With several rows gathered the same list holds the bulk verbs instead, which
+ * the panel decides: the overlay only has to say which of the two it is.
  */
 export function RevisionActionsOverlay({
  selectionLabel,
@@ -49,6 +55,7 @@ export function RevisionActionsOverlay({
  onRun,
  onClose,
  busy,
+ bulk,
  palette,
  metrics,
  theme,
@@ -130,7 +137,9 @@ export function RevisionActionsOverlay({
  const renderRow = ({ item }: { item: RevisionAction }) => (
   <Pressable
    accessibilityRole="button"
-   accessibilityLabel={`${item.label} on ${selectionLabel}`}
+   // A bulk label already says how many revisions it acts on, so naming the set
+   // again would read as "Abandon 2 revisions on 2 revisions".
+   accessibilityLabel={bulk ? item.label : `${item.label} on ${selectionLabel}`}
    onPress={() => {
     if (item.confirm) {
      setPending(item);
@@ -164,7 +173,7 @@ export function RevisionActionsOverlay({
    <View style={styles.card} testID="jj-revision-actions">
     <View style={styles.header}>
      <Text style={styles.title} numberOfLines={1}>
-      REVISION
+      {bulk ? "SELECTED" : "REVISION"}
      </Text>
      <Text style={styles.target} numberOfLines={1}>
       {selectionLabel}
