@@ -60,6 +60,27 @@ export async function snapshot({
  ]);
 
  const head = current[0] ?? null;
+ // `jj root` succeeds in a repository jj cannot actually read — a working-copy
+ // symlink Windows refuses, for example. Reporting an empty panel there hides
+ // the cause, so jj's own message is surfaced instead.
+ if (!head) {
+  const probe = await runJj(["status"], root);
+  if (!probe.ok) {
+   return {
+    isRepo: true,
+    root,
+    error: probe.stderr || "jj could not read this workspace.",
+    jjAvailable: true,
+    current: null,
+    parent: null,
+    conflicts: [],
+    files: [],
+    bookmarks: [],
+    recent: [],
+   };
+  }
+ }
+
  // `jj log` collapses a description to one line; the working copy wants the
  // whole thing, including newlines.
  const fullHead = head && description !== null ? { ...head, description: description.trimEnd() } : head;

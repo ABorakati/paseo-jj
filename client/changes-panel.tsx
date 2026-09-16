@@ -300,6 +300,15 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
     </View>
    ) : null}
 
+   {snapshot.error ? (
+    <View style={styles.banner}>
+     <Text style={[styles.buttonText, { color: palette.removedCount }]}>
+      jj could not read this workspace
+     </Text>
+     <Text style={styles.muted}>{snapshot.error}</Text>
+    </View>
+   ) : null}
+
    <View style={styles.toolbar}>
     <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.strip}>
      <View style={styles.stripRow}>
