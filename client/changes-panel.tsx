@@ -8,7 +8,9 @@ import { actionRpc, diffRpc, snapshotRpc } from "../shared/contracts";
 import { FileHeader, HunkHeader, NoteRow, SplitLine, UnifiedLine, monoFont } from "./diff-view";
 import { buildFileTree, orderFiles } from "./file-tree";
 import { FileTreeRail } from "./file-tree-rail";
+import { GraphView } from "./graph-view";
 import { buildPalette } from "./palette";
+import { BranchBar } from "./branch-bar";
 import { buildRevisionOptions, RevisionPickerOverlay, RevisionTrigger } from "./revision-picker";
 import { buildRows, type DiffRow } from "./rows";
 
@@ -18,6 +20,16 @@ import { buildRows, type DiffRow } from "./rows";
  * repeat cost well below the first read of a repository.
  */
 const POLL_MS = 5000;
+
+/** The picker is reused for the branch actions: the title and what a pick means
+ *  change, the searchable list does not. */
+type RevisionPickerPurpose = "select" | "merge" | "rebase";
+
+const PICKER_TITLE: Record<RevisionPickerPurpose, string> = {
+ select: "Choose a revision",
+ merge: "Merge with…",
+ rebase: "Rebase branch onto…",
+};
 
 export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePanelProps) {
  const workspace = useWorkspace(workspaceId, (snapshot) => ({
@@ -37,10 +49,13 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
  const [split, setSplit] = useState(!layout.compact);
  const [message, setMessage] = useState("");
  const [pendingRevert, setPendingRevert] = useState<string | null>(null);
- const [pickerOpen, setPickerOpen] = useState(false);
+ const [picker, setPicker] = useState<RevisionPickerPurpose | null>(null);
+ const [bookmarkName, setBookmarkName] = useState("");
+ const [pendingBookmarkDelete, setPendingBookmarkDelete] = useState<string | null>(null);
  const [collapsedFolders, setCollapsedFolders] = useState<ReadonlySet<string>>(new Set());
  const [treeVisible, setTreeVisible] = useState(!layout.compact);
  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+ const [mode, setMode] = useState<"diff" | "graph">("diff");
 
  const palette = useMemo(() => buildPalette(theme), [theme]);
  const metrics = useMemo(
@@ -98,10 +113,24 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
     parent: snapshot?.parent ?? null,
     recent: snapshot?.recent ?? [],
     bookmarks: snapshot?.bookmarks ?? [],
+    graph: snapshot?.graph ?? [],
    }),
   [snapshot],
  );
- const revisionName = revisionOptions.find((option) => option.id === revset)?.label ?? revset;
+ const revisionName =
+  (revisionOptions.find((option) => option.id === revset)?.label ||
+   // A revision picked out of the graph is a change id, which is not one of the
+   // picker's presets; its own description names it better than the id does.
+   snapshot?.graph.find((change) => change.changeId === revset)?.description.trim()) ||
+  revset;
+ // The graph marks a revision by change id, while the panel tracks a revset, so
+ // the two presets are resolved to the revision they currently name.
+ const selectedChangeId =
+  revset === "@"
+   ? (snapshot?.current?.changeId ?? null)
+   : revset === "@-"
+    ? (snapshot?.parent?.changeId ?? null)
+    : revset;
  const allCollapsed =
   fileTree.folderPaths.length > 0 &&
   fileTree.folderPaths.every((path) => collapsedFolders.has(path));
@@ -154,6 +183,7 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
    buttonActive: { backgroundColor: theme.colors.accent, borderColor: theme.colors.accent },
    buttonTextActive: { color: theme.colors.accentForeground, fontSize: metrics.fontSize },
    body: { flex: 1, flexDirection: "row" as const, minHeight: 0 },
+   graphPane: { flex: 1, minHeight: 0 },
    list: { flex: 1 },
    rail: {
     width: 240,
@@ -245,6 +275,52 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
    return allClosed ? new Set<string>() : new Set(fileTree.folderPaths);
   });
  }, [fileTree.folderPaths]);
+
+ /** A pick means whatever the picker was opened for: a revision to read, a
+  *  second parent to merge, or a destination to rebase onto. */
+ const pickRevision = useCallback(
+  (id: string) => {
+   const purpose = picker;
+   setPicker(null);
+   if (purpose === "merge" || purpose === "rebase") {
+    runAction.mutate({
+     directory: directory ?? "",
+     action: purpose,
+     revset: selectedChangeId ?? undefined,
+     target: id,
+    });
+    return;
+   }
+   setRevset(id);
+   setSelectedPath(null);
+  },
+  [directory, picker, runAction, selectedChangeId],
+ );
+
+ const runBookmark = useCallback(
+  (kind: "create" | "set" | "delete") => {
+   const name = bookmarkName.trim();
+   if (!name) return;
+   if (kind === "delete") {
+    // Deleting a bookmark is published on the next push, so it is confirmed.
+    setPendingBookmarkDelete(name);
+    return;
+   }
+   runAction.mutate({
+    directory: directory ?? "",
+    action: kind === "create" ? "bookmark-create" : "bookmark-set",
+    name,
+    revset: selectedChangeId ?? undefined,
+   });
+  },
+  [bookmarkName, directory, runAction, selectedChangeId],
+ );
+
+ const confirmBookmarkDelete = useCallback(() => {
+  const name = pendingBookmarkDelete;
+  if (!name) return;
+  runAction.mutate({ directory: directory ?? "", action: "bookmark-delete", name });
+ }, [directory, pendingBookmarkDelete, runAction]);
 
  const renderRow = useCallback(
   ({ item }: { item: DiffRow }) => {
@@ -369,8 +445,8 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
    <View style={styles.toolbar}>
     <RevisionTrigger
      label={revisionName}
-     open={pickerOpen}
-     onPress={() => setPickerOpen(true)}
+     open={picker !== null}
+     onPress={() => setPicker("select")}
      palette={palette}
      theme={theme}
      metrics={metrics}
@@ -382,17 +458,36 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
     <Pressable
      accessibilityRole="button"
      accessibilityLabel={treeVisible ? "Hide the file tree" : "Show the file tree"}
-     onPress={() => setTreeVisible((value) => !value)}
-     style={[styles.button, treeVisible ? styles.buttonActive : null]}
+     onPress={() => {
+      const next = !treeVisible;
+      setTreeVisible(next);
+      // The rail navigates the diff, so showing it returns to the diff.
+      if (next) setMode("diff");
+     }}
+     style={[styles.button, treeVisible && mode === "diff" ? styles.buttonActive : null]}
     >
      <Icon
       name="ListTree"
       size={14}
-      color={treeVisible ? theme.colors.accentForeground : palette.filePath}
+      color={treeVisible && mode === "diff" ? theme.colors.accentForeground : palette.filePath}
      />
-     <Text style={treeVisible ? styles.buttonTextActive : styles.buttonText}>
-      {layout.compact && treeVisible ? "Diff" : "Files"}
+     <Text style={treeVisible && mode === "diff" ? styles.buttonTextActive : styles.buttonText}>
+      {layout.compact && treeVisible && mode === "diff" ? "Diff" : "Files"}
      </Text>
+    </Pressable>
+
+    <Pressable
+     accessibilityRole="button"
+     accessibilityLabel={mode === "graph" ? "Show the diff" : "Show the revision graph"}
+     onPress={() => setMode((value) => (value === "graph" ? "diff" : "graph"))}
+     style={[styles.button, mode === "graph" ? styles.buttonActive : null]}
+    >
+     <Icon
+      name="GitFork"
+      size={14}
+      color={mode === "graph" ? theme.colors.accentForeground : palette.filePath}
+     />
+     <Text style={mode === "graph" ? styles.buttonTextActive : styles.buttonText}>Graph</Text>
     </Pressable>
 
     <Pressable
@@ -456,62 +551,96 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
     </View>
    ) : null}
 
-   <View style={styles.body}>
-    {treeVisible && layout.compact ? null : (
-     <FlatList
-      ref={listRef}
-      style={styles.list}
-      testID="jj-diff"
-      data={rows}
-      keyExtractor={(item) => item.key}
-      renderItem={renderRow}
-      initialNumToRender={30}
-      maxToRenderPerBatch={30}
-      windowSize={11}
-      removeClippedSubviews
-      onScrollToIndexFailed={(info) => {
-       // Rows are variable height, so an unmeasured index cannot be scrolled
-       // to directly. Estimate, then retry once the row has been rendered.
-       listRef.current?.scrollToOffset({
-        offset: info.averageItemLength * info.index,
-        animated: false,
-       });
-       setTimeout(() => {
-        listRef.current?.scrollToIndex({ index: info.index, animated: true });
-       }, 120);
-      }}
-      ListEmptyComponent={
-       <View style={styles.center}>
-        <Text style={styles.muted}>
-         {diffQuery.isPending
-          ? "Loading the diff…"
-          : isEmpty
-           ? "This change is empty. Edits an agent makes will appear here."
-           : "No content changes in this revision."}
-        </Text>
-       </View>
-      }
+   {mode === "graph" ? (
+    <View style={styles.graphPane}>
+     <BranchBar
+      selectionLabel={revisionName}
+      bookmarkName={bookmarkName}
+      onBookmarkNameChange={setBookmarkName}
+      pendingDelete={pendingBookmarkDelete}
+      busy={busy}
+      onBookmark={runBookmark}
+      onConfirmDelete={confirmBookmarkDelete}
+      onCancelDelete={() => setPendingBookmarkDelete(null)}
+      onMerge={() => setPicker("merge")}
+      onRebase={() => setPicker("rebase")}
+      onViewDiff={() => setMode("diff")}
+      palette={palette}
+      metrics={metrics}
+      theme={theme}
      />
-    )}
-
-    {treeVisible ? (
-     <View style={layout.compact ? styles.railWide : styles.rail}>
-      <FileTreeRail
-       rows={fileTree.rows}
-       collapsed={collapsedFolders}
-       selectedPath={selectedPath}
-       allCollapsed={allCollapsed}
-       loading={diffQuery.isPending}
-       onToggleFolder={toggleFolder}
-       onToggleCollapseAll={toggleCollapseAll}
-       onSelectFile={selectFile}
-       palette={palette}
-       metrics={metrics}
-       theme={theme}
+     <GraphView
+      changes={snapshot?.graph ?? []}
+      selectedChangeId={selectedChangeId}
+      currentChangeId={snapshot?.current?.changeId ?? null}
+      loading={snapshotQuery.isPending}
+      onSelect={(changeId) => {
+       setRevset(changeId);
+       setSelectedPath(null);
+      }}
+      palette={palette}
+      metrics={metrics}
+      theme={theme}
+     />
+    </View>
+   ) : (
+    <View style={styles.body}>
+     {treeVisible && layout.compact ? null : (
+      <FlatList
+       ref={listRef}
+       style={styles.list}
+       testID="jj-diff"
+       data={rows}
+       keyExtractor={(item) => item.key}
+       renderItem={renderRow}
+       initialNumToRender={30}
+       maxToRenderPerBatch={30}
+       windowSize={11}
+       removeClippedSubviews
+       onScrollToIndexFailed={(info) => {
+        // Rows are variable height, so an unmeasured index cannot be scrolled
+        // to directly. Estimate, then retry once the row has been rendered.
+        listRef.current?.scrollToOffset({
+         offset: info.averageItemLength * info.index,
+         animated: false,
+        });
+        setTimeout(() => {
+         listRef.current?.scrollToIndex({ index: info.index, animated: true });
+        }, 120);
+       }}
+       ListEmptyComponent={
+        <View style={styles.center}>
+         <Text style={styles.muted}>
+          {diffQuery.isPending
+           ? "Loading the diff…"
+           : isEmpty
+            ? "This change is empty. Edits an agent makes will appear here."
+            : "No content changes in this revision."}
+         </Text>
+        </View>
+       }
       />
-     </View>
-    ) : null}
-   </View>
+     )}
+
+     {treeVisible ? (
+      <View style={layout.compact ? styles.railWide : styles.rail}>
+       <FileTreeRail
+        rows={fileTree.rows}
+        collapsed={collapsedFolders}
+        selectedPath={selectedPath}
+        allCollapsed={allCollapsed}
+        loading={diffQuery.isPending}
+        onToggleFolder={toggleFolder}
+        onToggleCollapseAll={toggleCollapseAll}
+        onSelectFile={selectFile}
+        palette={palette}
+        metrics={metrics}
+        theme={theme}
+       />
+      </View>
+     ) : null}
+    </View>
+   )}
 
    {pendingRevert ? (
     <View style={styles.confirmBar}>
@@ -578,16 +707,13 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
     </View>
    ) : null}
 
-   {pickerOpen ? (
+   {picker ? (
     <RevisionPickerOverlay
+     title={PICKER_TITLE[picker]}
      options={revisionOptions}
      value={revset}
-     onSelect={(id) => {
-      setRevset(id);
-      setPickerOpen(false);
-      setSelectedPath(null);
-     }}
-     onClose={() => setPickerOpen(false)}
+     onSelect={pickRevision}
+     onClose={() => setPicker(null)}
      palette={palette}
      theme={theme}
      metrics={metrics}

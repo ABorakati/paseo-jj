@@ -66,6 +66,11 @@ const LOG_FIELDS = [
  'if(conflict, "1", "0")',
  'bookmarks.join(",")',
  "description.first_line()",
+ // Parents come last so a record that predates them still parses its head. The
+ // full change id is required: a shortened one does not match `change_id`, and
+ // a graph whose edges match no node is a column of unconnected dots.
+ 'parents.map(|c| c.change_id()).join(",")',
+ 'if(immutable, "1", "0")',
 ];
 
 const LOG_TEMPLATE =
@@ -87,6 +92,8 @@ function parseChanges(stdout: string): JjChange[] {
    conflicted: fields[5] === "1",
    bookmarks: (fields[6] ?? "").split(",").filter(Boolean),
    description: (fields[7] ?? "").replace(/\n$/, ""),
+   parents: (fields[8] ?? "").split(",").filter(Boolean),
+   immutable: fields[9] === "1",
   });
  }
  return changes;

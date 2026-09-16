@@ -13,6 +13,9 @@ import {
 } from "./jj";
 
 const RECENT_LIMIT = 30;
+/** The graph also carries bookmarks outside `@`'s ancestry, so it is wider. */
+const GRAPH_LIMIT = 60;
+const GRAPH_REVSET = "::@ | ancestors(bookmarks(), 5)";
 const MAX_DIFF_BYTES = 8 * 1024 * 1024;
 const MAX_MESSAGE_LENGTH = 4000;
 
@@ -42,6 +45,7 @@ export async function snapshot({
   files: [],
   bookmarks: [],
   recent: [],
+  graph: [],
  };
 
  if (!(await hasJj())) return { ...empty, jjAvailable: false };
@@ -49,7 +53,7 @@ export async function snapshot({
  const root = await findRepoRoot(directory);
  if (!root) return empty;
 
- const [current, parent, description, conflicts, files, bookmarks, recent] = await Promise.all([
+ const [current, parent, description, conflicts, files, bookmarks, recent, graph] = await Promise.all([
   listChanges(root, "@", 1),
   listChanges(root, "@-", 1),
   readCurrentDescription(root),
@@ -57,6 +61,7 @@ export async function snapshot({
   listChangedFiles(root, "@"),
   listBookmarks(root),
   listChanges(root, "::@", RECENT_LIMIT),
+  listChanges(root, GRAPH_REVSET, GRAPH_LIMIT),
  ]);
 
  const head = current[0] ?? null;
@@ -77,6 +82,7 @@ export async function snapshot({
     files: [],
     bookmarks: [],
     recent: [],
+    graph: [],
    };
   }
  }
@@ -96,6 +102,7 @@ export async function snapshot({
   files,
   bookmarks,
   recent,
+  graph,
  };
 }
 
@@ -152,6 +159,8 @@ export async function action({
  message,
  revset,
  paths,
+ name,
+ target,
 }: RpcInput<typeof actionRpc>): Promise<RpcOutput<typeof actionRpc>> {
  const root = await findRepoRoot(directory);
  if (!root) return { ok: false, error: "Not a jj workspace.", output: "" };
@@ -187,6 +196,43 @@ export async function action({
     .filter((value): value is string => value !== null);
    if (targets.length === 0) return { ok: false, error: "Select at least one file.", output: "" };
    args = ["restore", ...(revision ? ["--from", revision] : []), "--", ...targets];
+   break;
+  }
+  case "bookmark-create":
+  case "bookmark-set":
+  case "bookmark-delete": {
+   // Bookmarks are refs, not shas: the name is the argument, so it is checked
+   // like a revision and never allowed to look like a flag.
+   const bookmark = name ? safeArg(name) : null;
+   if (!bookmark) return { ok: false, error: "A bookmark name is required.", output: "" };
+   if (kind === "bookmark-delete") {
+    args = ["bookmark", "delete", bookmark];
+    break;
+   }
+   // `create` refuses a name that exists; `set` moves it, and that difference is
+   // the whole reason both are offered. A backwards move is refused by default,
+   // but here the reader picked both the name and the revision by hand, and
+   // `jj undo` takes it back, so the explicit move is honoured.
+   args =
+    kind === "bookmark-create"
+     ? ["bookmark", "create", bookmark, "-r", revision ?? "@"]
+     : ["bookmark", "set", bookmark, "-r", revision ?? "@", "--allow-backwards"];
+   break;
+  }
+  case "merge": {
+   const other = target ? safeArg(target) : null;
+   if (!other) return { ok: false, error: "Pick a second revision to merge.", output: "" };
+   // A merge in jj is a change with two parents, and it becomes the working
+   // copy so conflicts land where they can be edited.
+   args = ["new", revision ?? "@", other];
+   break;
+  }
+  case "rebase": {
+   const destination = target ? safeArg(target) : null;
+   if (!destination) return { ok: false, error: "Pick a destination revision.", output: "" };
+   // `-b` moves the branch relative to the destination: the commits that are
+   // not already there. `-s` would drag along everything below as well.
+   args = ["rebase", "-b", revision ?? "@", "-d", destination];
    break;
   }
   default:

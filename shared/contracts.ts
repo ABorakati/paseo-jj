@@ -15,6 +15,11 @@ export const changeSchema = z.object({
  empty: z.boolean(),
  conflicted: z.boolean(),
  bookmarks: z.array(z.string()),
+ /** Change ids of the parents, so a client can lay the revision graph out
+  *  without asking jj to draw it. Empty for the root revision. */
+ parents: z.array(z.string()),
+ /** Immutable revisions are outside the rewrite set, so the panel marks them. */
+ immutable: z.boolean(),
 });
 export type JjChange = z.output<typeof changeSchema>;
 
@@ -102,6 +107,9 @@ export const snapshotRpc = defineRpc({
   files: z.array(fileSummarySchema),
   bookmarks: z.array(z.string()),
   recent: z.array(changeSchema),
+  /** Ancestors of `@` plus recent bookmark history, newest first — the branch
+   *  structure the panel draws. */
+  graph: z.array(changeSchema),
  }),
 });
 
@@ -126,10 +134,27 @@ export const actionRpc = defineRpc({
  name: "jj.action",
  input: z.object({
   directory: z.string(),
-  action: z.enum(["commit", "describe", "new", "undo", "abandon", "restore"]),
+  action: z.enum([
+   "commit",
+   "describe",
+   "new",
+   "undo",
+   "abandon",
+   "restore",
+   "bookmark-create",
+   "bookmark-set",
+   "bookmark-delete",
+   "merge",
+   "rebase",
+  ]),
   message: z.string().optional(),
   revset: z.string().optional(),
   paths: z.array(z.string()).optional(),
+  /** Bookmark the bookmark actions act on. */
+  name: z.string().optional(),
+  /** The other revision: the second parent of a merge, or the destination of a
+   *  rebase. */
+  target: z.string().optional(),
  }),
  output: z.object({
   ok: z.boolean(),

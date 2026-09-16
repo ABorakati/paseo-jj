@@ -31,6 +31,9 @@ interface RevisionSource {
  parent: JjChange | null;
  recent: JjChange[];
  bookmarks: string[];
+ /** Everything the graph draws, so a revision visible there is also pickable
+  *  as a merge parent or rebase destination. */
+ graph: JjChange[];
 }
 
 const SHORT = 8;
@@ -57,6 +60,7 @@ export function buildRevisionOptions({
  parent,
  recent,
  bookmarks,
+ graph,
 }: RevisionSource): RevisionOption[] {
  const options: RevisionOption[] = [
   makeOption(
@@ -74,7 +78,9 @@ export function buildRevisionOptions({
   seen.add(bookmark);
   options.push(makeOption(bookmark, bookmark, "bookmark", []));
  }
- for (const change of recent) {
+ // `graph` repeats most of `recent` and adds the revisions beyond it; the `seen`
+ // set makes the two lists safe to concatenate.
+ for (const change of [...recent, ...graph]) {
   if (seen.has(change.changeId)) continue;
   seen.add(change.changeId);
   const description = change.description.trim().split("\n")[0]?.trim() ?? "";
@@ -147,6 +153,7 @@ export function RevisionTrigger({
 }
 
 interface RevisionPickerOverlayProps {
+ title: string;
  options: RevisionOption[];
  value: string;
  onSelect(revset: string): void;
@@ -166,6 +173,7 @@ interface RevisionPickerOverlayProps {
  * stay reachable without leaving the panel.
  */
 export function RevisionPickerOverlay({
+ title,
  options,
  value,
  onSelect,
@@ -237,6 +245,13 @@ export function RevisionPickerOverlay({
     paddingVertical: 8,
     borderBottomWidth: 1,
     borderColor: palette.splitDivider,
+   },
+   title: {
+    color: palette.filePathMuted,
+    fontSize: metrics.fontSize - 1,
+    fontWeight: "600" as const,
+    paddingHorizontal: 10,
+    paddingTop: 8,
    },
    input: {
     flex: 1,
@@ -319,6 +334,9 @@ export function RevisionPickerOverlay({
     onPress={onClose}
    />
    <View style={styles.card} testID="jj-revision-picker">
+    <Text style={styles.title} numberOfLines={1}>
+     {title}
+    </Text>
     <View style={styles.search}>
      <Icon name="Search" size={14} color={palette.filePathMuted} />
      <TextInput
