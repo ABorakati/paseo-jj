@@ -1,6 +1,6 @@
 import type { PluginWorkspacePanelProps } from "@getpaseo/plugin/client";
 import { useRpc, useWorkspace } from "@getpaseo/plugin/client";
-import { Icon, useToast } from "@getpaseo/plugin/client/react-native";
+import { Icon, copyText, useToast } from "@getpaseo/plugin/client/react-native";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FlatList, Pressable, Text, TextInput, View } from "react-native";
@@ -19,6 +19,7 @@ import {
 } from "./panel-layout";
 import { BranchBar } from "./branch-bar";
 import { buildRevisionOptions, RevisionPickerOverlay, RevisionTrigger } from "./revision-picker";
+import { RevisionActionsOverlay, type RevisionAction, type RevisionActionId } from "./revision-actions";
 import { buildRows, type DiffRow } from "./rows";
 
 /**
@@ -30,12 +31,13 @@ const POLL_MS = 5000;
 
 /** The picker is reused for the branch actions: the title and what a pick means
  *  change, the searchable list does not. */
-type RevisionPickerPurpose = "select" | "merge" | "rebase";
+type RevisionPickerPurpose = "select" | "merge" | "rebase" | "squash";
 
 const PICKER_TITLE: Record<RevisionPickerPurpose, string> = {
  select: "Choose a revision",
  merge: "Merge with…",
  rebase: "Rebase branch onto…",
+ squash: "Squash into…",
 };
 
 /** react-native's ViewStyle has neither key, and both matter on a desktop host:
@@ -44,6 +46,45 @@ const PICKER_TITLE: Record<RevisionPickerPurpose, string> = {
  *  on the web host only, so a native build never sees the unknown keys. */
 const WIDTH_HANDLE = { cursor: "col-resize", userSelect: "none" } as unknown as ViewStyle;
 const HEIGHT_HANDLE = { cursor: "row-resize", userSelect: "none" } as unknown as ViewStyle;
+
+/** The history verbs, in the order they are reached for. A verb that can leave
+ *  a revision behind carries the question its confirmation asks, because the
+ *  row itself cannot show what will be left. */
+const REVISION_ACTIONS: RevisionAction[] = [
+ { id: "edit", label: "Edit", hint: "move the working copy to this revision" },
+ { id: "new", label: "New child", hint: "start a revision on top of this one" },
+ { id: "insert-before", label: "Insert before", hint: "start a revision between this and its parent" },
+ { id: "insert-after", label: "Insert after", hint: "start a revision between this and its children" },
+ { id: "duplicate", label: "Duplicate", hint: "copy this revision onto its parents" },
+ { id: "merge", label: "Merge with…", hint: "a new revision with two parents" },
+ { id: "rebase", label: "Rebase onto…", hint: "move this branch onto another revision" },
+ {
+  id: "squash",
+  label: "Squash into parent",
+  hint: "fold this revision's changes into the one below",
+  confirm: "Squash this revision into its parent? It is abandoned if it empties.",
+ },
+ {
+  id: "squash-into",
+  label: "Squash into…",
+  hint: "fold this revision's changes into another one",
+ },
+ {
+  id: "absorb",
+  label: "Absorb",
+  hint: "move each change to the ancestor that last touched those lines",
+  confirm: "Absorb this revision into its mutable ancestors?",
+ },
+ { id: "bookmark-advance", label: "Advance bookmark", hint: "move a bookmark forward to this revision" },
+ { id: "push", label: "Push bookmark", hint: "publish the named bookmark to its remote" },
+ { id: "push-tracked", label: "Push tracked", hint: "publish every tracked bookmark" },
+ {
+  id: "abandon",
+  label: "Abandon",
+  hint: "drop this revision and its descendants",
+  confirm: "Abandon this revision? Its descendants move to its parents.",
+ },
+];
 
 export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePanelProps) {
  const workspace = useWorkspace(workspaceId, (snapshot) => ({
@@ -75,6 +116,7 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
  const [revisionsMinimized, setRevisionsMinimized] = useState(false);
  const [splitRatio, setSplitRatio] = useState(SPLIT_INITIAL);
  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+ const [actionsOpen, setActionsOpen] = useState(false);
 
  /** A drag is measured against the size at the moment the press happened. */
  const sidebarWidthRef = useRef(sidebarWidth);
@@ -198,6 +240,14 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
   *  they share it by the divider's ratio. */
  const filesFlex = filesMinimized ? 0 : revisionsMinimized ? 1 : splitRatio;
  const revisionsFlex = revisionsMinimized ? 0 : filesMinimized ? 1 : 1 - splitRatio;
+ const actions = useMemo<RevisionAction[]>(() => {
+  const name = bookmarkName.trim();
+  if (name) return REVISION_ACTIONS;
+  // With no name in the field there is nothing to publish by name, so the push
+  // row that would silently fall back to the tracked set is left out.
+  return REVISION_ACTIONS.filter((action) => action.id !== "push");
+ }, [bookmarkName]);
+
  const resizeCursor = layout.platform === "web" ? WIDTH_HANDLE : undefined;
  const splitCursor = layout.platform === "web" ? HEIGHT_HANDLE : undefined;
  /** Bookmarks already on the selected revision, offered as names to reuse. */
@@ -371,7 +421,7 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
   (id: string) => {
    const purpose = picker;
    setPicker(null);
-   if (purpose === "merge" || purpose === "rebase") {
+   if (purpose === "merge" || purpose === "rebase" || purpose === "squash") {
     runAction.mutate({
      directory: directory ?? "",
      action: purpose,
@@ -408,6 +458,46 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
   if (!name) return;
   runAction.mutate({ directory: directory ?? "", action: "bookmark-delete", name });
  }, [directory, pendingBookmarkDelete, runAction]);
+
+ /** Runs one verb from the actions list. The two that need a second revision
+  *  hand off to the picker instead of guessing one. */
+ const runRevisionAction = useCallback(
+  (id: RevisionActionId) => {
+   const revset = selectedChangeId ?? undefined;
+   const target = directory ?? "";
+   const name = bookmarkName.trim();
+   if (id === "squash-into") {
+    setActionsOpen(false);
+    setPicker("squash");
+    return;
+   }
+   if (id === "merge" || id === "rebase") {
+    setActionsOpen(false);
+    setPicker(id);
+    return;
+   }
+   setActionsOpen(false);
+   switch (id) {
+    case "push":
+     runAction.mutate({ directory: target, action: "push", name: name || undefined });
+     return;
+    case "push-tracked":
+     runAction.mutate({ directory: target, action: "push" });
+     return;
+    case "bookmark-advance":
+     runAction.mutate({ directory: target, action: "bookmark-advance", name: name || undefined, revset });
+     return;
+    case "insert-before":
+    case "insert-after":
+     // The composer's text names the revision being inserted, when it is set.
+     runAction.mutate({ directory: target, action: id, revset, message: message.trim() || undefined });
+     return;
+    default:
+     runAction.mutate({ directory: target, action: id, revset });
+   }
+  },
+  [bookmarkName, directory, message, runAction, selectedChangeId],
+ );
 
  const renderRow = useCallback(
   ({ item }: { item: DiffRow }) => {
@@ -489,7 +579,19 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
   <View style={styles.screen}>
    <View style={styles.header}>
     <View style={styles.row}>
-     <Text style={styles.changeId}>{current?.changeId.slice(0, 8) ?? "--------"}</Text>
+     <Pressable
+      accessibilityRole="button"
+      accessibilityLabel="Copy the change id"
+      onPress={() => {
+       const id = current?.changeId;
+       if (!id) return;
+       void copyText(id)
+        .then(() => toast.show(`Copied ${id}`, { variant: "success" }))
+        .catch(() => toast.error("Could not copy the change id."));
+      }}
+     >
+      <Text style={styles.changeId}>{current?.changeId.slice(0, 8) ?? "--------"}</Text>
+     </Pressable>
      {current?.conflicted ? (
       <View style={[styles.chip, { borderColor: palette.conflict }]}>
        <Text style={[styles.chipText, { color: palette.conflict }]}>conflicted</Text>
@@ -500,15 +602,33 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
        <Text style={styles.chipText}>empty</Text>
       </View>
      ) : null}
+     {current?.divergent ? (
+      <View style={[styles.chip, { borderColor: palette.conflict }]}>
+       <Text style={[styles.chipText, { color: palette.conflict }]}>divergent</Text>
+      </View>
+     ) : null}
      {current?.bookmarks.map((bookmark) => (
       <View key={bookmark} style={[styles.chip, styles.chipActive]}>
        <Text style={styles.chipTextActive}>{bookmark}</Text>
+      </View>
+     ))}
+     {current?.tags.map((tag) => (
+      <View key={tag} style={styles.chip}>
+       <Text style={styles.chipText}>{tag}</Text>
       </View>
      ))}
     </View>
     <Text style={styles.description} numberOfLines={3}>
      {current?.description.trim() || "No description yet"}
     </Text>
+    {current ? (
+     <Text style={styles.muted} numberOfLines={1}>
+      {current.author} · {current.age}
+      {current.committer && current.committer !== current.author
+       ? ` · committed by ${current.committer}`
+       : ""}
+     </Text>
+    ) : null}
    </View>
 
    {snapshot.conflicts.length > 0 ? (
@@ -730,6 +850,7 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
        minimized={revisionsMinimized}
        onToggleMinimized={() => setRevisionsMinimized((value) => !value)}
        onSelect={selectRevision}
+       onOpenActions={() => setActionsOpen(true)}
        palette={palette}
        metrics={metrics}
        theme={theme}
@@ -832,6 +953,20 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
      palette={palette}
      theme={theme}
      metrics={metrics}
+     compact={layout.compact}
+    />
+   ) : null}
+
+   {actionsOpen ? (
+    <RevisionActionsOverlay
+     selectionLabel={revisionName}
+     actions={actions}
+     onRun={runRevisionAction}
+     onClose={() => setActionsOpen(false)}
+     busy={busy}
+     palette={palette}
+     metrics={metrics}
+     theme={theme}
      compact={layout.compact}
     />
    ) : null}

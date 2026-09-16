@@ -71,6 +71,11 @@ const LOG_FIELDS = [
  // a graph whose edges match no node is a column of unconnected dots.
  'parents.map(|c| c.change_id()).join(",")',
  'if(immutable, "1", "0")',
+ "committer.name()",
+ 'committer.timestamp().format("%Y-%m-%d %H:%M")',
+ "author.timestamp().ago()",
+ 'tags.join(",")',
+ 'if(divergent, "1", "0")',
 ];
 
 const LOG_TEMPLATE =
@@ -94,6 +99,11 @@ function parseChanges(stdout: string): JjChange[] {
    description: (fields[7] ?? "").replace(/\n$/, ""),
    parents: (fields[8] ?? "").split(",").filter(Boolean),
    immutable: fields[9] === "1",
+   committer: fields[10] ?? "",
+   committerTimestamp: fields[11] ?? "",
+   age: fields[12] ?? "",
+   tags: (fields[13] ?? "").split(",").filter(Boolean),
+   divergent: fields[14] === "1",
   });
  }
  return changes;

@@ -1,4 +1,5 @@
 import type { PluginTheme } from "@getpaseo/plugin";
+import { Icon } from "@getpaseo/plugin/client/react-native";
 import { useCallback, useMemo } from "react";
 import { FlatList, Pressable, Text, View } from "react-native";
 import type { JjChange } from "../shared/contracts";
@@ -29,6 +30,8 @@ interface GraphViewProps {
  minimized: boolean;
  onToggleMinimized(): void;
  onSelect(changeId: string): void;
+ /** Opens the history verbs for the selected revision. */
+ onOpenActions(): void;
  palette: DiffPalette;
  metrics: Metrics;
  theme: PluginTheme;
@@ -48,6 +51,7 @@ export function GraphView({
  minimized,
  onToggleMinimized,
  onSelect,
+ onOpenActions,
  palette,
  metrics,
  theme,
@@ -84,6 +88,17 @@ export function GraphView({
     borderRadius: 4,
     overflow: "hidden" as const,
    },
+   /** Tags read like bookmarks but are not movable, so they are outlined. */
+   tag: {
+    color: palette.filePathMuted,
+    fontSize: metrics.fontSize - 1,
+    paddingHorizontal: 5,
+    paddingVertical: 1,
+    borderRadius: 4,
+    borderWidth: 1,
+    borderColor: palette.splitDivider,
+    overflow: "hidden" as const,
+   },
    conflicted: { color: palette.conflict, fontSize: metrics.fontSize - 1 },
    placeholder: { color: palette.filePathMuted, fontSize: metrics.fontSize, padding: 12 },
   }),
@@ -98,6 +113,7 @@ export function GraphView({
    const marks = [
     ...(change.empty ? ["empty"] : []),
     ...(change.conflicted ? ["conflicted"] : []),
+    ...(change.divergent ? ["divergent"] : []),
    ];
    return (
     <Pressable
@@ -129,8 +145,13 @@ export function GraphView({
         {bookmark}
        </Text>
       ))}
+      {change.tags.map((tag) => (
+       <Text key={tag} style={styles.tag} numberOfLines={1}>
+        {tag}
+       </Text>
+      ))}
       {marks.map((mark) => (
-       <Text key={mark} style={mark === "conflicted" ? styles.conflicted : styles.mark}>
+       <Text key={mark} style={mark === "empty" ? styles.mark : styles.conflicted}>
         {mark}
        </Text>
       ))}
@@ -154,6 +175,18 @@ export function GraphView({
     onToggle={onToggleMinimized}
     palette={palette}
     metrics={metrics}
+    trailing={
+     minimized ? null : (
+      <Pressable
+       accessibilityRole="button"
+       accessibilityLabel="Revision actions"
+       onPress={onOpenActions}
+       hitSlop={8}
+      >
+       <Icon name="EllipsisVertical" size={14} color={palette.filePathMuted} />
+      </Pressable>
+     )
+    }
    />
    {minimized ? null : (
     <FlatList

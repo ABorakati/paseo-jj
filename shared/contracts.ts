@@ -10,11 +10,20 @@ export const changeSchema = z.object({
  changeId: z.string(),
  commitId: z.string(),
  author: z.string(),
+ /** Relative, e.g. "2 hours ago": a log row reads better with age than with a
+  *  wall clock, and the absolute time is still there when it is wanted. */
+ age: z.string(),
  timestamp: z.string(),
+ committer: z.string(),
+ committerTimestamp: z.string(),
  description: z.string(),
  empty: z.boolean(),
  conflicted: z.boolean(),
  bookmarks: z.array(z.string()),
+ tags: z.array(z.string()),
+ /** True when more than one visible revision carries this change id, which is
+  *  the state that makes a change id ambiguous to edit. */
+ divergent: z.boolean(),
  /** Change ids of the parents, so a client can lay the revision graph out
   *  without asking jj to draw it. Empty for the root revision. */
  parents: z.array(z.string()),
@@ -130,29 +139,44 @@ export const diffRpc = defineRpc({
  }),
 });
 
+/** Every verb the panel can ask jj to run. Shared so the schema and the client
+ *  cannot drift: the client's action list is typed by this same union. */
+export const ACTION_IDS = [
+ "commit",
+ "describe",
+ "new",
+ "undo",
+ "redo",
+ "abandon",
+ "restore",
+ "edit",
+ "duplicate",
+ "squash",
+ "absorb",
+ "insert-before",
+ "insert-after",
+ "bookmark-set",
+ "bookmark-advance",
+ "bookmark-delete",
+ "merge",
+ "rebase",
+ "push",
+] as const;
+
+export type JjActionId = (typeof ACTION_IDS)[number];
+
 export const actionRpc = defineRpc({
  name: "jj.action",
  input: z.object({
   directory: z.string(),
-  action: z.enum([
-   "commit",
-   "describe",
-   "new",
-   "undo",
-   "abandon",
-   "restore",
-   "bookmark-set",
-   "bookmark-delete",
-   "merge",
-   "rebase",
-  ]),
+  action: z.enum(ACTION_IDS),
   message: z.string().optional(),
   revset: z.string().optional(),
   paths: z.array(z.string()).optional(),
   /** Bookmark the bookmark actions act on. */
   name: z.string().optional(),
-  /** The other revision: the second parent of a merge, or the destination of a
-   *  rebase. */
+  /** The other revision: the second parent of a merge, the destination of a
+   *  rebase or squash, or the revision a duplicate lands on. */
   target: z.string().optional(),
  }),
  output: z.object({

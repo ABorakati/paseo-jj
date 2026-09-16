@@ -231,6 +231,51 @@ export async function action({
    args = ["rebase", "-b", revision ?? "@", "-d", destination];
    break;
   }
+  case "redo":
+   args = ["redo"];
+   break;
+  case "edit":
+   args = ["edit", revision ?? "@"];
+   break;
+  case "duplicate": {
+   const onto = target ? safeArg(target) : null;
+   args = onto ? ["duplicate", revision ?? "@", "--onto", onto] : ["duplicate", revision ?? "@"];
+   break;
+  }
+  case "squash": {
+   const into = target ? safeArg(target) : null;
+   // Without `--into` the source squashes into its parent, which is the move
+   // people reach for most: fold this change into the one below it.
+   args = into
+    ? ["squash", "--from", revision ?? "@", "--into", into]
+    : ["squash", "-r", revision ?? "@"];
+   break;
+  }
+  case "absorb":
+   args = ["absorb", "--from", revision ?? "@"];
+   break;
+  case "insert-before":
+  case "insert-after": {
+   const flag = kind === "insert-before" ? "--insert-before" : "--insert-after";
+   args = text ? ["new", flag, revision ?? "@", "-m", text] : ["new", flag, revision ?? "@"];
+   break;
+  }
+  case "bookmark-advance": {
+   const bookmark = name ? safeArg(name) : null;
+   // Naming the bookmark targets it; without a name jj advances whichever
+   // bookmarks are the closest ancestors of the destination.
+   args = bookmark
+    ? ["bookmark", "advance", bookmark, "--to", revision ?? "@"]
+    : ["bookmark", "advance", "--to", revision ?? "@"];
+   break;
+  }
+  case "push": {
+   const bookmark = name ? safeArg(name) : null;
+   // A named bookmark is pushed on its own; otherwise the tracked bookmarks go,
+   // which is what a plain `git push` would have done.
+   args = bookmark ? ["git", "push", "--bookmark", bookmark] : ["git", "push", "--tracked"];
+   break;
+  }
   default:
    return { ok: false, error: "Unsupported action.", output: "" };
  }

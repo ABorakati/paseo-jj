@@ -207,6 +207,115 @@ async function main(): Promise<void> {
    "the bookmark is gone",
   );
 
+  // --- the history-editing verbs ---------------------------------------
+  // Each one rewrites the repo, so they run in an order that keeps the shape
+  // predictable: duplicate, insert, squash, edit, absorb, redo.
+  const detailSnap = await snapshot({ directory: root });
+  const head = detailSnap.current;
+  assert.ok(head, "the working copy is reported");
+  assert.ok(head!.author.length > 0, "the author's name is parsed");
+  assert.ok(head!.committer.length > 0, "the committer's name is parsed");
+  assert.ok(head!.age.length > 0, "the relative age is parsed");
+  assert.equal(head!.divergent, false, "an ordinary revision is not divergent");
+  assert.deepEqual(head!.tags, [], "a repository without tags reports none");
+
+  const duplicated = await action({ directory: root, action: "duplicate", revset: left });
+  assert.equal(duplicated.ok, true, duplicated.error ?? "");
+  const afterDuplicate = await snapshot({ directory: root });
+  assert.ok(
+   afterDuplicate.graph.some((change) => change.description === "left branch"),
+   "duplicating keeps the source revision",
+  );
+
+  const inserted = await action({
+   directory: root,
+   action: "insert-before",
+   revset: left,
+   message: "inserted before left",
+  });
+  assert.equal(inserted.ok, true, inserted.error ?? "");
+  assert.equal(
+   (await snapshot({ directory: root })).current?.description,
+   "inserted before left",
+   "the inserted revision is the new working copy",
+  );
+
+  const insertedAfter = await action({
+   directory: root,
+   action: "insert-after",
+   revset: left,
+   message: "inserted after left",
+  });
+  assert.equal(insertedAfter.ok, true, insertedAfter.error ?? "");
+  assert.equal(
+   (await snapshot({ directory: root })).current?.description,
+   "inserted after left",
+   "insert-after also lands the new working copy",
+  );
+
+  const advanced = await action({
+   directory: root,
+   action: "bookmark-advance",
+   name: "left-bookmark",
+   revset: merge,
+  });
+  assert.equal(advanced.ok, true, advanced.error ?? "");
+  assert.ok(
+   (await snapshot({ directory: root })).graph
+    .find((change) => change.changeId === merge)
+    ?.bookmarks.includes("left-bookmark"),
+   "advancing moves the named bookmark to the target revision",
+  );
+
+  // A squash moves the working copy's changes into its parent and abandons the
+  // emptied revision, so it is tested with content rather than on an empty
+  // revision, where jj has nothing to move and nothing to say.
+  writeFileSync(join(root, "squash-me.txt"), "squashed\n");
+  const describedForSquash = await action({
+   directory: root,
+   action: "describe",
+   message: "squash me",
+  });
+  assert.equal(describedForSquash.ok, true, describedForSquash.error ?? "");
+  const squashed = await action({ directory: root, action: "squash", revset: "@" });
+  assert.equal(squashed.ok, true, squashed.error ?? "");
+  const afterSquash = await snapshot({ directory: root });
+  assert.ok(
+   !afterSquash.graph.some((change) => change.description === "squash me"),
+   "squashing into the parent abandons the emptied source",
+  );
+  const parentAfterSquash = await diff({ directory: root, revset: "@-" });
+  assert.ok(
+   parentAfterSquash.files.some((file) => file.path === "squash-me.txt"),
+   "the squashed content landed in the parent revision",
+  );
+
+  const edited = await action({ directory: root, action: "edit", revset: left });
+  assert.equal(edited.ok, true, edited.error ?? "");
+  assert.equal(
+   (await snapshot({ directory: root })).current?.changeId,
+   left,
+   "edit moves the working copy onto that revision",
+  );
+
+  const absorbed = await action({ directory: root, action: "absorb", revset: "@" });
+  assert.equal(absorbed.ok, true, absorbed.error ?? "");
+  assert.equal(
+   (await action({ directory: root, action: "undo" })).ok,
+   true,
+   "an absorb can be taken back",
+  );
+
+  await action({ directory: root, action: "undo" });
+  const redone = await action({ directory: root, action: "redo" });
+  assert.equal(redone.ok, true, redone.error ?? "");
+
+  // Pushing with no remote and nothing tracked is a no-op that exits 0, so the
+  // panel reports jj's own words rather than an error it invented.
+  const push = await action({ directory: root, action: "push" });
+  assert.equal(push.ok, true, push.error ?? "");
+  assert.match(push.output, /Nothing changed/i, `push said: ${push.output}`);
+
   // --- guards and negative paths ----------------------------------------
   const injected = await action({
    directory: root,
