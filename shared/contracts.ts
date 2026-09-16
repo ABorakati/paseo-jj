@@ -196,3 +196,28 @@ export const actionRpc = defineRpc({
   output: z.string(),
  }),
 });
+
+/**
+ * Writing the working copy is the one change the panel makes itself instead of
+ * asking jj for: an edit typed into the diff has to land in the file before jj's
+ * next snapshot can see it. The path comes from the client, so the server
+ * resolves it against the workspace root and refuses anything outside it.
+ *
+ * `expected` is the file's text as the client read it. When it is given and no
+ * longer matches, the write is refused: the panel watches agents edit the same
+ * files, and a stale edit must not overwrite what one of them wrote meanwhile.
+ */
+export const writeFileRpc = defineRpc({
+ name: "jj.write-file",
+ input: z.object({
+  directory: z.string(),
+  path: z.string(),
+  content: z.string(),
+  expected: z.string().optional(),
+ }),
+ output: z.object({
+  ok: z.boolean(),
+  error: z.string().nullable(),
+ }),
+});
+

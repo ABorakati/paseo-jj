@@ -1,8 +1,8 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import type { RpcInput, RpcOutput } from "@getpaseo/plugin";
-import { actionRpc, diffRpc, snapshotRpc } from "../shared/contracts";
+import { actionRpc, diffRpc, snapshotRpc, writeFileRpc } from "../shared/contracts";
 import { applyHunks, describeFile, parseGitDiff, shouldHighlight } from "./diff";
 import {
  findRepoRoot,
@@ -22,6 +22,9 @@ const GRAPH_LIMIT = 60;
 const GRAPH_REVSET = "::@ | ancestors(bookmarks(), 5)";
 const MAX_DIFF_BYTES = 8 * 1024 * 1024;
 const MAX_MESSAGE_LENGTH = 4000;
+/** An edit typed into the panel is bounded: a mistaken paste must not rewrite a
+ *  file the diff could not even show. */
+const MAX_FILE_BYTES = 2 * 1024 * 1024;
 
 /**
  * Every argument reaches jj as a separate argv entry, so there is no shell to
@@ -433,3 +436,53 @@ export async function action({
   cleanup?.();
  }
 }
+
+/**
+ * The one write the panel makes itself rather than asking jj for: an edit typed
+ * into the diff has to land in the file before jj's next snapshot can see it.
+ * The path is the client's, so both it and its real target are resolved against
+ * the workspace root and refused unless they stay inside it — the diff view can
+ * only name a file of the working copy, and this is what makes that true.
+ */
+export async function writeFile({
+ directory,
+ path: requested,
+ content,
+ expected,
+}: RpcInput<typeof writeFileRpc>): Promise<RpcOutput<typeof writeFileRpc>> {
+ const root = await findRepoRoot(directory);
+ if (root === null) return { ok: false, error: "This workspace is not a jj repository." };
+ const target = safeArg(requested);
+ if (target === null || target.length === 0) {
+  return { ok: false, error: "That path cannot be written." };
+ }
+
+ let absolute: string;
+ let realRoot: string;
+ try {
+  realRoot = realpathSync(root);
+  absolute = realpathSync(resolve(realRoot, target));
+ } catch {
+  return { ok: false, error: "That file is not in the working copy." };
+ }
+ const inside = relative(realRoot, absolute);
+ if (inside.length === 0 || inside.startsWith("..") || isAbsolute(inside)) {
+  return { ok: false, error: "That path is outside the workspace." };
+ }
+ if (!statSync(absolute).isFile()) {
+  return { ok: false, error: "That path is not a file." };
+ }
+
+ // The panel watches agents edit these same files, so an edit built from a read
+ // that has since gone stale is refused rather than allowed to overwrite them.
+ if (expected !== undefined && expected !== readFileSync(absolute, "utf8")) {
+  return { ok: false, error: "That file changed since the diff was read. Refresh and edit again." };
+ }
+ if (Buffer.byteLength(content, "utf8") > MAX_FILE_BYTES) {
+  return { ok: false, error: "That file is too large to edit in the panel." };
+ }
+
+ writeFileSync(absolute, content, "utf8");
+ return { ok: true, error: null };
+}
+

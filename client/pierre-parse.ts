@@ -1,5 +1,4 @@
-import type { FileDiffMetadata } from "@pierre/diffs";
-import { parsePatchFiles } from "@pierre/diffs";
+import { parsePatchFiles, type FileDiffMetadata } from "./vendor/pierre.js";
 import type { JjFileDiff } from "../shared/contracts";
 import { filePatch } from "./pierre-patch";
 
@@ -28,8 +27,8 @@ function headerOnly(file: JjFileDiff): FileDiffMetadata {
 
 /**
  * What Pierre renders for one file. Kept apart from the patch builder because
- * this is the only module in the diff surface that loads `@pierre/diffs`, which
- * is ESM-only.
+ * this is the only module in the diff surface that loads Pierre's runtime, which
+ * arrives as the vendored bundle (see client/vendor/pierre.d.ts).
  */
 export function parseFile(file: JjFileDiff): FileDiffMetadata {
  return parsePatchFiles(filePatch(file))[0]?.files[0] ?? headerOnly(file);

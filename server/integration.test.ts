@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { action, diff, snapshot } from "./changes";
+import { action, diff, snapshot, writeFile } from "./changes";
 import { hasJj } from "./jj";
 import { buildGraph } from "../client/revision-graph";
 
@@ -597,6 +597,56 @@ async function main(): Promise<void> {
    );
   } finally {
    rmSync(picked, { recursive: true, force: true });
+  }
+
+  // --- editing a working-copy file ---
+  {
+   writeFileSync(join(root, "editable.txt"), "first line\n");
+   const wrote = await writeFile({ directory: root, path: "editable.txt", content: "second line\n" });
+   assert.equal(wrote.ok, true, "a working-copy file can be written");
+   assert.equal(readFileSync(join(root, "editable.txt"), "utf8"), "second line\n", "the bytes reach the file");
+
+   const stale = await writeFile({
+    directory: root,
+    path: "editable.txt",
+    content: "third line\n",
+    expected: "text the file no longer holds\n",
+   });
+   assert.equal(stale.ok, false, "an edit built from a stale read is refused");
+   assert.equal(
+    readFileSync(join(root, "editable.txt"), "utf8"),
+    "second line\n",
+    "a refused edit leaves the file alone",
+   );
+
+   const matched = await writeFile({
+    directory: root,
+    path: "editable.txt",
+    content: "third line\n",
+    expected: "second line\n",
+   });
+   assert.equal(matched.ok, true, "an edit that matches the file goes through");
+
+   assert.equal(
+    (await writeFile({ directory: root, path: "../escape.txt", content: "no\n" })).ok,
+    false,
+    "a path outside the workspace is refused",
+   );
+   assert.equal(
+    (await writeFile({ directory: root, path: "-flag.txt", content: "no\n" })).ok,
+    false,
+    "a path that would read as a flag is refused",
+   );
+   assert.equal(
+    (await writeFile({ directory: root, path: "missing.txt", content: "no\n" })).ok,
+    false,
+    "a file that is not in the working copy is refused",
+   );
+   assert.equal(
+    (await snapshot({ directory: root })).files.some((file) => file.path === "editable.txt"),
+    true,
+    "jj reads the edited file on its next snapshot",
+   );
   }
 
   console.log("integration.test.ts: all assertions passed");

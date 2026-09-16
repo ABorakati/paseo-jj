@@ -4,6 +4,7 @@
   "version": "0.0.0",
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "build:pierre": "node build/vendor-pierre.mjs",
     "test": "tsx server/diff.test.ts && tsx server/tokenize.test.ts && tsx client/pierre-patch.test.ts && tsx client/file-tree.test.ts && tsx client/revision-graph.test.ts && tsx client/panel-layout.test.ts && tsx client/gestures.test.ts",
     "test:integration": "tsx server/integration.test.ts"
   },
@@ -12,6 +13,7 @@
     "@tanstack/react-query": "^5.90.11",
     "@types/node": "^22.20.3",
     "@types/react": "~19.2.0",
+    "esbuild": "^0.28.2",
     "react": "19.1.0",
     "react-native": "0.81.5",
     "tsx": "^4.23.13",

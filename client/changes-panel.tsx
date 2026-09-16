@@ -33,6 +33,7 @@ import {
 import { BranchBar } from "./branch-bar";
 import { buildRevisionOptions, RevisionPickerOverlay, RevisionTrigger } from "./revision-picker";
 import { RevisionActionsOverlay, type RevisionAction, type RevisionActionId } from "./revision-actions";
+import { useSquashHunks } from "./squash";
 
 /**
  * The working copy changes under the panel as agents edit files, so the
@@ -634,16 +635,31 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
  }, []);
 
  /**
-  * The seam the squash-by-selection work plugs into. Nothing behind it yet: the
-  * server command that keeps or drops one hunk of a revision lands separately,
-  * so this reports the request rather than guessing at a jj invocation.
+  * The hunk buttons in a file header move one hunk out of the revision on
+  * screen and into that revision's parent: their "reject" means the change
+  * leaves this revision. "Accept" keeps it here, which is what jj does when
+  * asked for nothing. The destination is written as the displayed revset's own
+  * parent so the hunk numbering the server checks against is the one on screen.
   */
+ const squashHunks = useSquashHunks(workspaceId);
  const onHunkAction = useCallback(
   (input: HunkActionInput) => {
-   const verb = input.kind === "accept" ? "Accept" : "Reject";
-   toast.show(`${verb} hunk ${input.hunkIndex + 1} of ${input.file}`);
+   if (input.kind === "accept") {
+    toast.show(`Hunk ${input.hunkIndex + 1} stays in this revision`);
+    return;
+   }
+   squashHunks({
+    file: input.file,
+    hunkIndexes: [input.hunkIndex],
+    from: revset,
+    into: `(${revset})-`,
+   }).catch((error: unknown) => {
+    // jj's own words: it refuses an immutable destination and hunks that no
+    // longer match with a message the reader can act on.
+    toast.show(error instanceof Error ? error.message : "jj refused to move that hunk");
+   });
   },
-  [toast],
+  [revset, squashHunks, toast],
  );
 
  const selectFile = useCallback(
@@ -690,25 +706,25 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
   });
  }, [fileTree.folderPaths]);
 
-const toggleChecked = useCallback((path: string) => {
- setCheckedPaths((current) => {
-  const next = new Set(current);
-  if (next.has(path)) next.delete(path);
-  else next.add(path);
-  return next;
- });
-}, []);
+ const toggleChecked = useCallback((path: string) => {
+  setCheckedPaths((current) => {
+   const next = new Set(current);
+   if (next.has(path)) next.delete(path);
+   else next.add(path);
+   return next;
+  });
+ }, []);
 
-const toggleCheckAll = useCallback(() => {
- setCheckedPaths(
-  allFilesChecked ? new Set() : new Set(orderedFiles.map((file) => file.path)),
- );
-}, [allFilesChecked, orderedFiles]);
+ const toggleCheckAll = useCallback(() => {
+  setCheckedPaths(
+   allFilesChecked ? new Set() : new Set(orderedFiles.map((file) => file.path)),
+  );
+ }, [allFilesChecked, orderedFiles]);
 
-/** Picked files still need somewhere to go, which is what the picker answers. */
-const askWhereCheckedGo = useCallback(() => {
- if (checkedFiles.size > 0) setPicker("squash-files");
-}, [checkedFiles]);
+ /** Picked files still need somewhere to go, which is what the picker answers. */
+ const askWhereCheckedGo = useCallback(() => {
+  if (checkedFiles.size > 0) setPicker("squash-files");
+ }, [checkedFiles]);
 
  /**
   * Runs a bulk verb over the revisions the reader gathered. The plan says how
@@ -848,20 +864,20 @@ const askWhereCheckedGo = useCallback(() => {
   [bookmarkName, directory, message, runAction, selectedChangeId],
  );
 
-/** Runs one verb from the bulk list. The two that act where they are go at
-  *  once; a rebase needs a destination, so it hands the selection to the
-  *  picker and comes back when there is one. */
-const runBulkAction = useCallback(
- (id: RevisionActionId) => {
-  if (id === "rebase") {
-   setPickerTargets(targets);
-   setPicker("rebase");
-   return;
-  }
-  if (id === "abandon" || id === "squash") runBulk(id, targets);
- },
- [runBulk, targets],
-);
+ /** Runs one verb from the bulk list. The two that act where they are go at
+   *  once; a rebase needs a destination, so it hands the selection to the
+   *  picker and comes back when there is one. */
+ const runBulkAction = useCallback(
+  (id: RevisionActionId) => {
+   if (id === "rebase") {
+    setPickerTargets(targets);
+    setPicker("rebase");
+    return;
+   }
+   if (id === "abandon" || id === "squash") runBulk(id, targets);
+  },
+  [runBulk, targets],
+ );
 
 
  if (directory === null) {

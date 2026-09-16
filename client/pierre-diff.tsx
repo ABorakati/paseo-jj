@@ -1,4 +1,4 @@
-import { CodeView, type CodeViewHandle, type CodeViewItem } from "@pierre/diffs/react";
+import { CodeView, type CodeViewHandle, type CodeViewItem } from "./vendor/pierre.js";
 import type { CSSProperties, Ref } from "react";
 import { memo, useCallback, useImperativeHandle, useMemo, useRef } from "react";
 import { View } from "react-native";
