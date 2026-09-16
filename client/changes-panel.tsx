@@ -2,14 +2,21 @@ import type { PluginWorkspacePanelProps } from "@getpaseo/plugin/client";
 import { useRpc, useWorkspace } from "@getpaseo/plugin/client";
 import { Icon, useToast } from "@getpaseo/plugin/client/react-native";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FlatList, Pressable, Text, TextInput, View } from "react-native";
+import type { PointerEvent, ViewStyle } from "react-native";
 import { actionRpc, diffRpc, snapshotRpc } from "../shared/contracts";
 import { FileHeader, HunkHeader, NoteRow, SplitLine, UnifiedLine, monoFont } from "./diff-view";
 import { buildFileTree, orderFiles } from "./file-tree";
 import { FileTreeRail } from "./file-tree-rail";
 import { GraphView } from "./graph-view";
 import { buildPalette } from "./palette";
+import {
+ SIDEBAR_INITIAL_WIDTH,
+ SPLIT_INITIAL,
+ draggedSidebarWidth,
+ draggedSplitRatio,
+} from "./panel-layout";
 import { BranchBar } from "./branch-bar";
 import { buildRevisionOptions, RevisionPickerOverlay, RevisionTrigger } from "./revision-picker";
 import { buildRows, type DiffRow } from "./rows";
@@ -30,6 +37,13 @@ const PICKER_TITLE: Record<RevisionPickerPurpose, string> = {
  merge: "Merge with…",
  rebase: "Rebase branch onto…",
 };
+
+/** react-native's ViewStyle has neither key, and both matter on a desktop host:
+ *  a handle with no cursor reads as a plain border, and one that lets the
+ *  browser start a text selection loses the gesture to a native drag. Applied
+ *  on the web host only, so a native build never sees the unknown keys. */
+const WIDTH_HANDLE = { cursor: "col-resize", userSelect: "none" } as unknown as ViewStyle;
+const HEIGHT_HANDLE = { cursor: "row-resize", userSelect: "none" } as unknown as ViewStyle;
 
 export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePanelProps) {
  const workspace = useWorkspace(workspaceId, (snapshot) => ({
@@ -56,9 +70,53 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
  const [pendingBookmarkDelete, setPendingBookmarkDelete] = useState<string | null>(null);
  const [collapsedFolders, setCollapsedFolders] = useState<ReadonlySet<string>>(new Set());
  const [treeVisible, setTreeVisible] = useState(!layout.compact);
+ const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_INITIAL_WIDTH);
+ const [filesMinimized, setFilesMinimized] = useState(false);
+ const [revisionsMinimized, setRevisionsMinimized] = useState(false);
+ const [splitRatio, setSplitRatio] = useState(SPLIT_INITIAL);
  const [selectedPath, setSelectedPath] = useState<string | null>(null);
- const [mode, setMode] = useState<"diff" | "graph">("diff");
 
+ /** A drag is measured against the size at the moment the press happened. */
+ const sidebarWidthRef = useRef(sidebarWidth);
+ const splitRatioRef = useRef(splitRatio);
+ const sidebarHeightRef = useRef(0);
+ /** Live drags; null when nothing is being dragged. */
+ const sidebarDrag = useRef<{ startX: number; startWidth: number } | null>(null);
+ const splitDrag = useRef<{ startY: number; startRatio: number } | null>(null);
+
+ useEffect(() => {
+  sidebarWidthRef.current = sidebarWidth;
+  splitRatioRef.current = splitRatio;
+ }, [sidebarWidth, splitRatio]);
+
+ /**
+  * The drag is tracked on the pane that contains the handle rather than on the
+  * handle itself. Pointer events bubble, so a move anywhere in the pane reaches
+  * these handlers — which matters because the handle shifts under the cursor as
+  * the sidebar resizes, and a gesture tied to a 6px strip cannot follow it.
+  */
+ const onDragMove = (event: PointerEvent) => {
+  const sidebar = sidebarDrag.current;
+  if (sidebar) {
+   const deltaX = event.nativeEvent.pageX - sidebar.startX;
+   if (Math.abs(deltaX) >= 2) {
+    setSidebarWidth(draggedSidebarWidth(sidebar.startWidth, deltaX));
+   }
+   return;
+  }
+  const split = splitDrag.current;
+  if (split) {
+   const deltaY = event.nativeEvent.pageY - split.startY;
+   if (Math.abs(deltaY) >= 2) {
+    setSplitRatio(draggedSplitRatio(split.startRatio, deltaY, sidebarHeightRef.current));
+   }
+  }
+ };
+
+ const endDrag = () => {
+  sidebarDrag.current = null;
+  splitDrag.current = null;
+ };
  const palette = useMemo(() => buildPalette(theme), [theme]);
  const metrics = useMemo(
   () => ({ fontSize: layout.compact ? 11 : 12, fontFamily: monoFont(layout.platform) }),
@@ -136,6 +194,15 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
  const allCollapsed =
   fileTree.folderPaths.length > 0 &&
   fileTree.folderPaths.every((path) => collapsedFolders.has(path));
+ /** Whichever section is open on its own takes the whole column; with both open
+  *  they share it by the divider's ratio. */
+ const filesFlex = filesMinimized ? 0 : revisionsMinimized ? 1 : splitRatio;
+ const revisionsFlex = revisionsMinimized ? 0 : filesMinimized ? 1 : 1 - splitRatio;
+ const resizeCursor = layout.platform === "web" ? WIDTH_HANDLE : undefined;
+ const splitCursor = layout.platform === "web" ? HEIGHT_HANDLE : undefined;
+ /** Bookmarks already on the selected revision, offered as names to reuse. */
+ const selectedBookmarks =
+  snapshot?.graph.find((change) => change.changeId === selectedChangeId)?.bookmarks ?? [];
 
  const styles = useMemo(
   () => ({
@@ -185,15 +252,24 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
    buttonActive: { backgroundColor: theme.colors.accent, borderColor: theme.colors.accent },
    buttonTextActive: { color: theme.colors.accentForeground, fontSize: metrics.fontSize },
    body: { flex: 1, flexDirection: "row" as const, minHeight: 0 },
-   graphPane: { flex: 1, minHeight: 0 },
    list: { flex: 1 },
-   rail: {
-    width: 240,
-    flexShrink: 0,
-    borderLeftWidth: 1,
-    borderColor: palette.splitDivider,
-   },
+   /** The sidebar's width comes from state; the handle beside it paints the
+    *  edge, so the rail carries no border of its own. */
+   rail: { flexShrink: 0 },
    railWide: { flex: 1 },
+   /** Grab area for the sidebar's width: a 6px strip that paints a single line,
+    *  so the edge still looks like a border. */
+   sidebarHandle: {
+    width: 6,
+    flexShrink: 0,
+    alignItems: "center" as const,
+    justifyContent: "center" as const,
+   },
+   sidebarHandleLine: { width: 1, flex: 1, backgroundColor: palette.splitDivider },
+   /** Grab area between the two sections, shown only while both are open. */
+   splitHandle: { height: 7, justifyContent: "center" as const },
+   splitHandleLine: { height: 1, backgroundColor: palette.splitDivider },
+   railDivider: { height: 1, backgroundColor: palette.splitDivider },
    composer: {
     borderTopWidth: 1,
     borderColor: palette.splitDivider,
@@ -261,6 +337,17 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
   [layout.compact, scrollToFile],
  );
 
+ /** The sidebar selects the revision the diff reads; on a narrow pane that is
+  *  the whole errand, so it hands the pane back to the diff. */
+ const selectRevision = useCallback(
+  (changeId: string) => {
+   setRevset(changeId);
+   setSelectedPath(null);
+   if (layout.compact) setTreeVisible(false);
+  },
+  [layout.compact],
+ );
+
  const toggleFolder = useCallback((path: string) => {
   setCollapsedFolders((folders) => {
    const next = new Set(folders);
@@ -299,24 +386,22 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
   [directory, picker, runAction, selectedChangeId],
  );
 
- const runBookmark = useCallback(
-  (kind: "create" | "set" | "delete") => {
-   const name = bookmarkName.trim();
-   if (!name) return;
-   if (kind === "delete") {
-    // Deleting a bookmark is published on the next push, so it is confirmed.
-    setPendingBookmarkDelete(name);
-    return;
-   }
-   runAction.mutate({
-    directory: directory ?? "",
-    action: kind === "create" ? "bookmark-create" : "bookmark-set",
-    name,
-    revset: selectedChangeId ?? undefined,
-   });
-  },
-  [bookmarkName, directory, runAction, selectedChangeId],
- );
+ const setBookmark = useCallback(() => {
+  const name = bookmarkName.trim();
+  if (!name) return;
+  runAction.mutate({
+   directory: directory ?? "",
+   action: "bookmark-set",
+   name,
+   revset: selectedChangeId ?? undefined,
+  });
+ }, [bookmarkName, directory, runAction, selectedChangeId]);
+
+ const deleteBookmark = useCallback(() => {
+  const name = bookmarkName.trim();
+  // Deleting a bookmark is published on the next push, so it is confirmed.
+  if (name) setPendingBookmarkDelete(name);
+ }, [bookmarkName]);
 
  const confirmBookmarkDelete = useCallback(() => {
   const name = pendingBookmarkDelete;
@@ -459,37 +544,18 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
    <View style={styles.toolbar}>
     <Pressable
      accessibilityRole="button"
-     accessibilityLabel={treeVisible ? "Hide the file tree" : "Show the file tree"}
-     onPress={() => {
-      const next = !treeVisible;
-      setTreeVisible(next);
-      // The rail navigates the diff, so showing it returns to the diff.
-      if (next) setMode("diff");
-     }}
-     style={[styles.button, treeVisible && mode === "diff" ? styles.buttonActive : null]}
+     accessibilityLabel={treeVisible ? "Hide the sidebar" : "Show the sidebar"}
+     onPress={() => setTreeVisible(!treeVisible)}
+     style={[styles.button, treeVisible ? styles.buttonActive : null]}
     >
      <Icon
-      name="ListTree"
+      name="PanelRight"
       size={14}
-      color={treeVisible && mode === "diff" ? theme.colors.accentForeground : palette.filePath}
+      color={treeVisible ? theme.colors.accentForeground : palette.filePath}
      />
-     <Text style={treeVisible && mode === "diff" ? styles.buttonTextActive : styles.buttonText}>
-      {layout.compact && treeVisible && mode === "diff" ? "Diff" : "Files"}
+     <Text style={treeVisible ? styles.buttonTextActive : styles.buttonText}>
+      {layout.compact && treeVisible ? "Diff" : "Sidebar"}
      </Text>
-    </Pressable>
-
-    <Pressable
-     accessibilityRole="button"
-     accessibilityLabel={mode === "graph" ? "Show the diff" : "Show the revision graph"}
-     onPress={() => setMode((value) => (value === "graph" ? "diff" : "graph"))}
-     style={[styles.button, mode === "graph" ? styles.buttonActive : null]}
-    >
-     <Icon
-      name="GitFork"
-      size={14}
-      color={mode === "graph" ? theme.colors.accentForeground : palette.filePath}
-     />
-     <Text style={mode === "graph" ? styles.buttonTextActive : styles.buttonText}>Graph</Text>
     </Pressable>
 
     <Pressable
@@ -553,96 +619,143 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
     </View>
    ) : null}
 
-   {mode === "graph" ? (
-    <View style={styles.graphPane}>
-     <BranchBar
-      selectionLabel={revisionName}
-      bookmarkName={bookmarkName}
-      onBookmarkNameChange={setBookmarkName}
-      pendingDelete={pendingBookmarkDelete}
-      busy={busy}
-      onBookmark={runBookmark}
-      onConfirmDelete={confirmBookmarkDelete}
-      onCancelDelete={() => setPendingBookmarkDelete(null)}
-      onMerge={() => setPicker("merge")}
-      onRebase={() => setPicker("rebase")}
-      onViewDiff={() => setMode("diff")}
-      palette={palette}
-      metrics={metrics}
-      theme={theme}
-     />
-     <GraphView
-      changes={snapshot?.graph ?? []}
-      selectedChangeId={selectedChangeId}
-      currentChangeId={snapshot?.current?.changeId ?? null}
-      loading={snapshotQuery.isPending}
-      onSelect={(changeId) => {
-       setRevset(changeId);
-       setSelectedPath(null);
+   <View
+    style={styles.body}
+    onPointerMove={onDragMove}
+    onPointerUp={endDrag}
+    onPointerLeave={endDrag}
+    onPointerCancel={endDrag}
+   >
+    {treeVisible && layout.compact ? null : (
+     <FlatList
+      ref={listRef}
+      style={styles.list}
+      testID="jj-diff"
+      data={rows}
+      keyExtractor={(item) => item.key}
+      renderItem={renderRow}
+      initialNumToRender={30}
+      maxToRenderPerBatch={30}
+      windowSize={11}
+      removeClippedSubviews
+      onScrollToIndexFailed={(info) => {
+       // Rows are variable height, so an unmeasured index cannot be scrolled
+       // to directly. Estimate, then retry once the row has been rendered.
+       listRef.current?.scrollToOffset({
+        offset: info.averageItemLength * info.index,
+        animated: false,
+       });
+       setTimeout(() => {
+        listRef.current?.scrollToIndex({ index: info.index, animated: true });
+       }, 120);
       }}
-      palette={palette}
-      metrics={metrics}
-      theme={theme}
+      ListEmptyComponent={
+       <View style={styles.center}>
+        <Text style={styles.muted}>
+         {diffQuery.isPending
+          ? "Loading the diff…"
+          : isEmpty
+           ? "This change is empty. Edits an agent makes will appear here."
+           : "No content changes in this revision."}
+        </Text>
+       </View>
+      }
      />
-    </View>
-   ) : (
-    <View style={styles.body}>
-     {treeVisible && layout.compact ? null : (
-      <FlatList
-       ref={listRef}
-       style={styles.list}
-       testID="jj-diff"
-       data={rows}
-       keyExtractor={(item) => item.key}
-       renderItem={renderRow}
-       initialNumToRender={30}
-       maxToRenderPerBatch={30}
-       windowSize={11}
-       removeClippedSubviews
-       onScrollToIndexFailed={(info) => {
-        // Rows are variable height, so an unmeasured index cannot be scrolled
-        // to directly. Estimate, then retry once the row has been rendered.
-        listRef.current?.scrollToOffset({
-         offset: info.averageItemLength * info.index,
-         animated: false,
-        });
-        setTimeout(() => {
-         listRef.current?.scrollToIndex({ index: info.index, animated: true });
-        }, 120);
-       }}
-       ListEmptyComponent={
-        <View style={styles.center}>
-         <Text style={styles.muted}>
-          {diffQuery.isPending
-           ? "Loading the diff…"
-           : isEmpty
-            ? "This change is empty. Edits an agent makes will appear here."
-            : "No content changes in this revision."}
-         </Text>
-        </View>
-       }
-      />
-     )}
+    )}
 
-     {treeVisible ? (
-      <View style={layout.compact ? styles.railWide : styles.rail}>
-       <FileTreeRail
-        rows={fileTree.rows}
-        collapsed={collapsedFolders}
-        selectedPath={selectedPath}
-        allCollapsed={allCollapsed}
-        loading={diffQuery.isPending}
-        onToggleFolder={toggleFolder}
-        onToggleCollapseAll={toggleCollapseAll}
-        onSelectFile={selectFile}
+    {treeVisible && !layout.compact ? (
+     <View
+      style={[styles.sidebarHandle, resizeCursor]}
+      accessibilityLabel="Resize the sidebar"
+      onPointerDown={(event) => {
+       // Without this the browser starts a text selection over the pane, turns
+       // that into a native drag and cancels the pointer stream mid-gesture.
+       event.preventDefault();
+       sidebarDrag.current = {
+        startX: event.nativeEvent.pageX,
+        startWidth: sidebarWidthRef.current,
+       };
+      }}
+     >
+      <View style={styles.sidebarHandleLine} />
+     </View>
+    ) : null}
+
+    {treeVisible ? (
+     <View
+      style={layout.compact ? styles.railWide : [styles.rail, { width: sidebarWidth }]}
+      onLayout={(event) => {
+       sidebarHeightRef.current = event.nativeEvent.layout.height;
+      }}
+     >
+      <FileTreeRail
+       rows={fileTree.rows}
+       collapsed={collapsedFolders}
+       selectedPath={selectedPath}
+       allCollapsed={allCollapsed}
+       loading={diffQuery.isPending}
+       flex={filesFlex}
+       minimized={filesMinimized}
+       onToggleMinimized={() => setFilesMinimized((value) => !value)}
+       onToggleFolder={toggleFolder}
+       onToggleCollapseAll={toggleCollapseAll}
+       onSelectFile={selectFile}
+       palette={palette}
+       metrics={metrics}
+       theme={theme}
+      />
+      {filesMinimized || revisionsMinimized ? (
+       <View style={styles.railDivider} />
+      ) : (
+       <View
+        style={[styles.splitHandle, splitCursor]}
+        accessibilityLabel="Resize the sidebar sections"
+        onPointerDown={(event) => {
+         event.preventDefault();
+         splitDrag.current = {
+          startY: event.nativeEvent.pageY,
+          startRatio: splitRatioRef.current,
+         };
+        }}
+       >
+        <View style={styles.splitHandleLine} />
+       </View>
+      )}
+      <GraphView
+       changes={snapshot?.graph ?? []}
+       selectedChangeId={selectedChangeId}
+       currentChangeId={snapshot?.current?.changeId ?? null}
+       loading={snapshotQuery.isPending}
+       flex={revisionsFlex}
+       minimized={revisionsMinimized}
+       onToggleMinimized={() => setRevisionsMinimized((value) => !value)}
+       onSelect={selectRevision}
+       palette={palette}
+       metrics={metrics}
+       theme={theme}
+      />
+      {layout.compact || revisionsMinimized ? null : (
+       <BranchBar
+        selectionLabel={revisionName}
+        bookmarks={selectedBookmarks}
+        bookmarkName={bookmarkName}
+        onBookmarkNameChange={setBookmarkName}
+        pendingDelete={pendingBookmarkDelete}
+        busy={busy}
+        onSet={setBookmark}
+        onDelete={deleteBookmark}
+        onConfirmDelete={confirmBookmarkDelete}
+        onCancelDelete={() => setPendingBookmarkDelete(null)}
+        onMerge={() => setPicker("merge")}
+        onRebase={() => setPicker("rebase")}
         palette={palette}
         metrics={metrics}
         theme={theme}
        />
-      </View>
-     ) : null}
-    </View>
-   )}
+      )}
+     </View>
+    ) : null}
+   </View>
 
    {pendingRevert ? (
     <View style={styles.confirmBar}>

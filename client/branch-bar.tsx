@@ -3,6 +3,7 @@ import { Icon, TextInput } from "@getpaseo/plugin/client/react-native";
 import { useMemo } from "react";
 import { Pressable, Text, View } from "react-native";
 import type { DiffPalette } from "./palette";
+import { RailHeader } from "./rail-header";
 
 interface Metrics {
  fontSize: number;
@@ -13,59 +14,59 @@ interface BranchBarProps {
  /** The revision every action here applies to, named the way the trigger names
   *  it so the two never disagree. */
  selectionLabel: string;
+ /** Bookmarks already on that revision. Clicking one fills the name field,
+  *  since its name is the one thing the reader cannot guess. */
+ bookmarks: string[];
  bookmarkName: string;
  onBookmarkNameChange(value: string): void;
  pendingDelete: string | null;
  busy: boolean;
- onBookmark(kind: "create" | "set" | "delete"): void;
+ onSet(): void;
+ onDelete(): void;
  onConfirmDelete(): void;
  onCancelDelete(): void;
  onMerge(): void;
  onRebase(): void;
- onViewDiff(): void;
  palette: DiffPalette;
  metrics: Metrics;
  theme: PluginTheme;
 }
 
 /**
- * Branch controls for the selected revision. jj has no branch object to check
- * out: a bookmark is a movable name for a revision, and a merge is a new
- * revision with two parents, so both read as "point a name here" and "combine
- * these two".
+ * Controls for the revision selected in the graph.
+ *
+ * A revision has one description and any number of bookmarks, and neither is
+ * derived from the other: the description names the change, a bookmark is a
+ * movable pointer to it that remotes can be told about. So this bar does the
+ * pointer half — one name, one verb (`jj bookmark set` creates the bookmark or
+ * moves it), plus the two ways to combine or move history.
  */
 export function BranchBar({
  selectionLabel,
+ bookmarks,
  bookmarkName,
  onBookmarkNameChange,
  pendingDelete,
  busy,
- onBookmark,
+ onSet,
+ onDelete,
  onConfirmDelete,
  onCancelDelete,
  onMerge,
  onRebase,
- onViewDiff,
  palette,
  metrics,
  theme,
 }: BranchBarProps) {
  const styles = useMemo(
   () => ({
-   bar: {
-    borderBottomWidth: 1,
-    borderColor: palette.splitDivider,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    gap: 6,
-   },
+   bar: { paddingHorizontal: 10, paddingBottom: 8, gap: 6 },
+   target: { color: palette.filePathMuted, fontSize: metrics.fontSize - 1, flexShrink: 1 },
    row: { flexDirection: "row" as const, alignItems: "center" as const, gap: 6, flexWrap: "wrap" as const },
-   label: { color: palette.filePathMuted, fontSize: metrics.fontSize - 1 },
-   selection: { color: palette.filePath, fontSize: metrics.fontSize, flexShrink: 1 },
    input: {
     flexGrow: 1,
     flexShrink: 1,
-    minWidth: 90,
+    minWidth: 70,
     color: palette.filePath,
     backgroundColor: theme.colors.surface1,
     borderWidth: 1,
@@ -90,6 +91,15 @@ export function BranchBar({
    buttonText: { color: palette.filePath, fontSize: metrics.fontSize },
    buttonTextPrimary: { color: theme.colors.accentForeground, fontSize: metrics.fontSize },
    disabled: { opacity: 0.45 },
+   chip: {
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+    borderWidth: 1,
+    borderColor: palette.splitDivider,
+    maxWidth: "100%" as const,
+   },
+   chipText: { color: palette.filePathMuted, fontSize: metrics.fontSize - 1 },
    confirm: {
     flexDirection: "row" as const,
     alignItems: "center" as const,
@@ -109,26 +119,20 @@ export function BranchBar({
 
  return (
   <View style={styles.bar}>
-   <View style={styles.row}>
-    <Text style={styles.label}>at</Text>
-    <Text style={styles.selection} numberOfLines={1}>
-     {selectionLabel}
-    </Text>
-    <View style={{ flex: 1 }} />
-    <Pressable
-     accessibilityRole="button"
-     accessibilityLabel="View this revision's diff"
-     onPress={onViewDiff}
-     style={styles.button}
-    >
-     <Icon name="FileDiff" size={13} color={palette.filePath} />
-     <Text style={styles.buttonText}>Diff</Text>
-    </Pressable>
-   </View>
+   <RailHeader
+    label="BOOKMARK"
+    palette={palette}
+    metrics={metrics}
+    trailing={
+     <Text style={styles.target} numberOfLines={1}>
+      at {selectionLabel}
+     </Text>
+    }
+   />
 
    {pendingDelete ? (
     <View style={styles.confirm}>
-     <Text style={[styles.label, { flex: 1, color: palette.filePath }]} numberOfLines={2}>
+     <Text style={[styles.buttonText, { flex: 1 }]} numberOfLines={2}>
       Delete bookmark {pendingDelete}? The deletion reaches remotes on the next push.
      </Text>
      <Pressable
@@ -150,43 +154,53 @@ export function BranchBar({
      </Pressable>
     </View>
    ) : (
-    <View style={styles.row}>
-     <TextInput
-      style={styles.input}
-      value={bookmarkName}
-      onChangeText={onBookmarkNameChange}
-      placeholder="bookmark name"
-      placeholderTextColor={palette.filePathMuted}
-      accessibilityLabel="Bookmark name"
-     />
-     <Pressable
-      accessibilityRole="button"
-      accessibilityLabel="Create the bookmark at this revision"
-      onPress={() => onBookmark("create")}
-      disabled={!canName}
-      style={[styles.button, styles.buttonPrimary, !canName ? styles.disabled : null]}
-     >
-      <Text style={styles.buttonTextPrimary}>Create</Text>
-     </Pressable>
-     <Pressable
-      accessibilityRole="button"
-      accessibilityLabel="Move the bookmark to this revision"
-      onPress={() => onBookmark("set")}
-      disabled={!canName}
-      style={[styles.button, !canName ? styles.disabled : null]}
-     >
-      <Text style={styles.buttonText}>Move</Text>
-     </Pressable>
-     <Pressable
-      accessibilityRole="button"
-      accessibilityLabel="Delete the bookmark"
-      onPress={() => onBookmark("delete")}
-      disabled={!canName}
-      style={[styles.button, !canName ? styles.disabled : null]}
-     >
-      <Icon name="Trash2" size={13} color={palette.removedCount} />
-     </Pressable>
-    </View>
+    <>
+     <View style={styles.row}>
+      <TextInput
+       style={styles.input}
+       value={bookmarkName}
+       onChangeText={onBookmarkNameChange}
+       placeholder="bookmark name"
+       placeholderTextColor={palette.filePathMuted}
+       accessibilityLabel="Bookmark name"
+      />
+      <Pressable
+       accessibilityRole="button"
+       accessibilityLabel="Set the bookmark here, creating or moving it"
+       onPress={onSet}
+       disabled={!canName}
+       style={[styles.button, styles.buttonPrimary, !canName ? styles.disabled : null]}
+      >
+       <Text style={styles.buttonTextPrimary}>Set</Text>
+      </Pressable>
+      <Pressable
+       accessibilityRole="button"
+       accessibilityLabel="Delete the named bookmark"
+       onPress={onDelete}
+       disabled={!canName}
+       style={[styles.button, !canName ? styles.disabled : null]}
+      >
+       <Icon name="Trash2" size={13} color={palette.removedCount} />
+      </Pressable>
+     </View>
+     {bookmarks.length > 0 ? (
+      <View style={styles.row}>
+       {bookmarks.map((bookmark) => (
+        <Pressable
+         key={bookmark}
+         accessibilityRole="button"
+         accessibilityLabel={`Use the bookmark ${bookmark}`}
+         onPress={() => onBookmarkNameChange(bookmark)}
+         style={styles.chip}
+        >
+         <Text style={styles.chipText} numberOfLines={1}>
+          {bookmark}
+         </Text>
+        </Pressable>
+       ))}
+      </View>
+     ) : null}
+    </>
    )}
 
    <View style={styles.row}>

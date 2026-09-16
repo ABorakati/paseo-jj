@@ -5,6 +5,7 @@ import { FlatList, Pressable, Text, View } from "react-native";
 import { STATUS_LABEL, statusColor } from "./diff-view";
 import type { FileTreeRow } from "./file-tree";
 import type { DiffPalette } from "./palette";
+import { RailHeader } from "./rail-header";
 
 /** Indentation per tree level, matching the app's other directory trees. */
 const INDENT_PER_LEVEL = 12;
@@ -49,6 +50,10 @@ interface FileTreeRailProps {
  /** True while the diff for the picked revision is still in flight, so an empty
   *  tree reads as loading rather than as a revision with no changes. */
  loading: boolean;
+ /** Share of the sidebar's height this section claims; 0 while minimized. */
+ flex: number;
+ minimized: boolean;
+ onToggleMinimized(): void;
  onToggleFolder(path: string): void;
  onToggleCollapseAll(): void;
  onSelectFile(path: string): void;
@@ -68,6 +73,9 @@ export function FileTreeRail({
  selectedPath,
  allCollapsed,
  loading,
+ flex,
+ minimized,
+ onToggleMinimized,
  onToggleFolder,
  onToggleCollapseAll,
  onSelectFile,
@@ -77,21 +85,6 @@ export function FileTreeRail({
 }: FileTreeRailProps) {
  const styles = useMemo(
   () => ({
-   header: {
-    flexDirection: "row" as const,
-    alignItems: "center" as const,
-    justifyContent: "space-between" as const,
-    paddingHorizontal: BASE_INDENT,
-    paddingVertical: 6,
-    borderBottomWidth: 1,
-    borderColor: palette.splitDivider,
-   },
-   headerText: {
-    color: palette.filePathMuted,
-    fontSize: metrics.fontSize - 1,
-    fontWeight: "600" as const,
-    letterSpacing: 0.4,
-   },
    row: {
     flexDirection: "row" as const,
     alignItems: "center" as const,
@@ -182,33 +175,49 @@ export function FileTreeRail({
   [collapsed, metrics, onSelectFile, onToggleFolder, palette, selectedPath, styles],
  );
 
+ // A minimized section must not carry a flex value: `flex: 0` resolves to a
+ // zero basis, which collapses the header to nothing and paints it over the
+ // section below.
+ const sectionStyle = minimized ? { flexGrow: 0, flexShrink: 0 } : { flex, minHeight: 0 };
+
  return (
-  <View style={{ flex: 1 }}>
-   <View style={styles.header}>
-    <Text style={styles.headerText}>CHANGED FILES</Text>
-    <Pressable
-     accessibilityRole="button"
-     accessibilityLabel={allCollapsed ? "Expand every folder" : "Collapse every folder"}
-     onPress={onToggleCollapseAll}
-     hitSlop={8}
-    >
-     <Icon
-      name={allCollapsed ? "ListChevronsUpDown" : "ListChevronsDownUp"}
-      size={14}
-      color={palette.filePathMuted}
-     />
-    </Pressable>
-   </View>
-   <FlatList
-    data={rows}
-    testID="jj-file-tree"
-    keyExtractor={(item: FileTreeRow) => (item.kind === "folder" ? `d:${item.path}` : item.path)}
-    renderItem={renderRow}
-    initialNumToRender={40}
-    ListEmptyComponent={
-     <Text style={styles.empty}>{loading ? "Loading the diff…" : "No changed files."}</Text>
+  <View style={sectionStyle}>
+   <RailHeader
+    label="CHANGED FILES"
+    collapsed={minimized}
+    onToggle={onToggleMinimized}
+    palette={palette}
+    metrics={metrics}
+    trailing={
+     minimized ? null : (
+      <Pressable
+       accessibilityRole="button"
+       accessibilityLabel={allCollapsed ? "Expand every folder" : "Collapse every folder"}
+       onPress={onToggleCollapseAll}
+       hitSlop={8}
+      >
+       <Icon
+        name={allCollapsed ? "ListChevronsUpDown" : "ListChevronsDownUp"}
+        size={14}
+        color={palette.filePathMuted}
+       />
+      </Pressable>
+     )
     }
    />
+   {minimized ? null : (
+    <FlatList
+     data={rows}
+     testID="jj-file-tree"
+     style={{ flex: 1 }}
+     keyExtractor={(item: FileTreeRow) => (item.kind === "folder" ? `d:${item.path}` : item.path)}
+     renderItem={renderRow}
+     initialNumToRender={40}
+     ListEmptyComponent={
+      <Text style={styles.empty}>{loading ? "Loading the diff…" : "No changed files."}</Text>
+     }
+    />
+   )}
   </View>
  );
 }

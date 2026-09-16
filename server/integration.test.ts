@@ -146,26 +146,19 @@ async function main(): Promise<void> {
   );
 
   // --- bookmark, merge and rebase actions -------------------------------
+  // `set` is deliberately the only verb the panel offers: jj creates the
+  // bookmark when the name is free and moves it when it is not.
   const created = await action({
    directory: root,
-   action: "bookmark-create",
+   action: "bookmark-set",
    name: "work",
    revset: merge,
   });
   assert.equal(created.ok, true, created.error ?? "");
   assert.ok(
    (await snapshot({ directory: root })).bookmarks.includes("work"),
-   "a bookmark is created at the given revision",
+   "setting a free name creates the bookmark",
   );
-
-  // The same name at another revision must be moved explicitly, not silently.
-  const duplicate = await action({
-   directory: root,
-   action: "bookmark-create",
-   name: "work",
-   revset: base,
-  });
-  assert.equal(duplicate.ok, false, "creating an existing bookmark is refused");
 
   const moved = await action({
    directory: root,
@@ -177,7 +170,11 @@ async function main(): Promise<void> {
   const movedSnap = await snapshot({ directory: root });
   assert.ok(
    movedSnap.graph.find((change) => change.changeId === base)?.bookmarks.includes("work"),
-   "a moved bookmark rides its new revision",
+   "setting a taken name moves the bookmark to the new revision",
+  );
+  assert.ok(
+   !movedSnap.graph.find((change) => change.changeId === merge)?.bookmarks.includes("work"),
+   "and it is no longer on the old revision",
   );
 
   // A merge of the two branch tips, which is the working copy afterwards.

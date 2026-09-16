@@ -3,6 +3,7 @@ import { useCallback, useMemo } from "react";
 import { FlatList, Pressable, Text, View } from "react-native";
 import type { JjChange } from "../shared/contracts";
 import type { DiffPalette } from "./palette";
+import { RailHeader } from "./rail-header";
 import { buildGraph } from "./revision-graph";
 
 /** One colour per lane, ordered so neighbouring lanes never share one. Kept
@@ -23,6 +24,10 @@ interface GraphViewProps {
  selectedChangeId: string | null;
  currentChangeId: string | null;
  loading: boolean;
+ /** Share of the sidebar's height this section claims; 0 while minimized. */
+ flex: number;
+ minimized: boolean;
+ onToggleMinimized(): void;
  onSelect(changeId: string): void;
  palette: DiffPalette;
  metrics: Metrics;
@@ -39,6 +44,9 @@ export function GraphView({
  selectedChangeId,
  currentChangeId,
  loading,
+ flex,
+ minimized,
+ onToggleMinimized,
  onSelect,
  palette,
  metrics,
@@ -133,19 +141,35 @@ export function GraphView({
   [byId, laneColors, onSelect, selectedChangeId, styles],
  );
 
+ // A minimized section must not carry a flex value: `flex: 0` resolves to a
+ // zero basis, which collapses the header to nothing and paints it over the
+ // section below.
+ const sectionStyle = minimized ? { flexGrow: 0, flexShrink: 0 } : { flex, minHeight: 0 };
+
  return (
-  <FlatList
-   data={rows}
-   testID="jj-graph"
-   style={{ flex: 1 }}
-   keyExtractor={(item: (typeof rows)[number]) => item.changeId}
-   renderItem={renderRow}
-   initialNumToRender={40}
-   ListEmptyComponent={
-    <Text style={styles.placeholder}>
-     {loading ? "Loading the graph…" : "No revisions to show."}
-    </Text>
-   }
-  />
+  <View style={sectionStyle}>
+   <RailHeader
+    label="REVISIONS"
+    collapsed={minimized}
+    onToggle={onToggleMinimized}
+    palette={palette}
+    metrics={metrics}
+   />
+   {minimized ? null : (
+    <FlatList
+     data={rows}
+     testID="jj-graph"
+     style={{ flex: 1 }}
+     keyExtractor={(item: (typeof rows)[number]) => item.changeId}
+     renderItem={renderRow}
+     initialNumToRender={40}
+     ListEmptyComponent={
+      <Text style={styles.placeholder}>
+       {loading ? "Loading the graph…" : "No revisions to show."}
+      </Text>
+     }
+    />
+   )}
+  </View>
  );
 }

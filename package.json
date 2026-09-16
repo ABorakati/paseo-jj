@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "tsx server/diff.test.ts && tsx server/tokenize.test.ts && tsx client/rows.test.ts && tsx client/file-tree.test.ts && tsx client/revision-graph.test.ts",
+    "test": "tsx server/diff.test.ts && tsx server/tokenize.test.ts && tsx client/rows.test.ts && tsx client/file-tree.test.ts && tsx client/revision-graph.test.ts && tsx client/panel-layout.test.ts",
     "test:integration": "tsx server/integration.test.ts"
   },
   "devDependencies": {

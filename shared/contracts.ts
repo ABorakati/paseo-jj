@@ -141,7 +141,6 @@ export const actionRpc = defineRpc({
    "undo",
    "abandon",
    "restore",
-   "bookmark-create",
    "bookmark-set",
    "bookmark-delete",
    "merge",

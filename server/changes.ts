@@ -198,7 +198,6 @@ export async function action({
    args = ["restore", ...(revision ? ["--from", revision] : []), "--", ...targets];
    break;
   }
-  case "bookmark-create":
   case "bookmark-set":
   case "bookmark-delete": {
    // Bookmarks are refs, not shas: the name is the argument, so it is checked
@@ -209,14 +208,11 @@ export async function action({
     args = ["bookmark", "delete", bookmark];
     break;
    }
-   // `create` refuses a name that exists; `set` moves it, and that difference is
-   // the whole reason both are offered. A backwards move is refused by default,
-   // but here the reader picked both the name and the revision by hand, and
-   // `jj undo` takes it back, so the explicit move is honoured.
-   args =
-    kind === "bookmark-create"
-     ? ["bookmark", "create", bookmark, "-r", revision ?? "@"]
-     : ["bookmark", "set", bookmark, "-r", revision ?? "@", "--allow-backwards"];
+   // `jj bookmark set` both creates and moves, which is one verb for the reader
+   // instead of two. A backwards move is refused by default; here the reader
+   // picked the name and the revision by hand and `jj undo` takes it back, so
+   // the explicit move is honoured.
+   args = ["bookmark", "set", bookmark, "-r", revision ?? "@", "--allow-backwards"];
    break;
   }
   case "merge": {
