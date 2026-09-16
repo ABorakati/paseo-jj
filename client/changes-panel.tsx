@@ -4,10 +4,10 @@ import { useRpc, useWorkspace } from "@getpaseo/plugin/client";
 import { Icon, copyText, useToast } from "@getpaseo/plugin/client/react-native";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { FlatList, Pressable, Text, TextInput, View } from "react-native";
+import { Pressable, Text, TextInput, View } from "react-native";
 import type { PointerEvent, ViewStyle } from "react-native";
 import { actionRpc, diffRpc, snapshotRpc } from "../shared/contracts";
-import { FileHeader, HunkHeader, NoteRow, SplitLine, UnifiedLine, monoFont } from "./diff-view";
+import { monoFont } from "./diff-view";
 import { buildFileTree, orderFiles } from "./file-tree";
 import { FileTreeRail } from "./file-tree-rail";
 import {
@@ -23,6 +23,7 @@ import {
 import { GraphView } from "./graph-view";
 import { useHeldKeys } from "./held-keys";
 import { buildPalette } from "./palette";
+import { PierreDiffView, type HunkActionInput, type PierreDiffHandle } from "./pierre-diff";
 import {
  SIDEBAR_INITIAL_WIDTH,
  SPLIT_INITIAL,
@@ -32,7 +33,6 @@ import {
 import { BranchBar } from "./branch-bar";
 import { buildRevisionOptions, RevisionPickerOverlay, RevisionTrigger } from "./revision-picker";
 import { RevisionActionsOverlay, type RevisionAction, type RevisionActionId } from "./revision-actions";
-import { buildRows, type DiffRow } from "./rows";
 
 /**
  * The working copy changes under the panel as agents edit files, so the
@@ -171,7 +171,7 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
  const callAction = useRpc(actionRpc);
  const toast = useToast();
  const queryClient = useQueryClient();
- const listRef = useRef<FlatList<DiffRow>>(null);
+ const diffRef = useRef<PierreDiffHandle>(null);
 
  const [revset, setRevset] = useState("@");
  // Unified reads top to bottom and needs no horizontal room, which is what this
@@ -440,7 +440,6 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
  const allFilesChecked =
   orderedFiles.length > 0 && orderedFiles.every((file) => checkedPaths.has(file.path));
  const fileTree = useMemo(() => buildFileTree(files, collapsedFolders), [files, collapsedFolders]);
- const { rows, fileRowIndex } = useMemo(() => buildRows(orderedFiles, split), [orderedFiles, split]);
  const revisionOptions = useMemo(
   () =>
    buildRevisionOptions({
@@ -549,7 +548,6 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
    buttonActive: { backgroundColor: theme.colors.accent, borderColor: theme.colors.accent },
    buttonTextActive: { color: theme.colors.accentForeground, fontSize: metrics.fontSize },
    body: { flex: 1, flexDirection: "row" as const, minHeight: 0 },
-   list: { flex: 1 },
    /** The sidebar's width comes from state; the handle beside it paints the
     *  edge, so the rail carries no border of its own. */
    rail: { flexShrink: 0 },
@@ -627,13 +625,25 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
   [palette, theme, metrics, layout.compact],
  );
 
- const scrollToFile = useCallback(
-  (path: string) => {
-   const index = fileRowIndex.get(path);
-   if (index === undefined) return;
-   listRef.current?.scrollToIndex({ index, animated: true });
+ /**
+  * The file tree is the ordering authority for both surfaces, so a picked path
+  * is already the id Pierre keys that file's rendered item by.
+  */
+ const scrollToFile = useCallback((path: string) => {
+  diffRef.current?.scrollToFile(path);
+ }, []);
+
+ /**
+  * The seam the squash-by-selection work plugs into. Nothing behind it yet: the
+  * server command that keeps or drops one hunk of a revision lands separately,
+  * so this reports the request rather than guessing at a jj invocation.
+  */
+ const onHunkAction = useCallback(
+  (input: HunkActionInput) => {
+   const verb = input.kind === "accept" ? "Accept" : "Reject";
+   toast.show(`${verb} hunk ${input.hunkIndex + 1} of ${input.file}`);
   },
-  [fileRowIndex],
+  [toast],
  );
 
  const selectFile = useCallback(
@@ -838,43 +848,21 @@ const askWhereCheckedGo = useCallback(() => {
   [bookmarkName, directory, message, runAction, selectedChangeId],
  );
 
- /** Runs one verb from the bulk list. The two that act where they are go at
-   *  once; a rebase needs a destination, so it hands the selection to the
-   *  picker and comes back when there is one. */
- const runBulkAction = useCallback(
-  (id: RevisionActionId) => {
-   if (id === "rebase") {
-    setPickerTargets(targets);
-    setPicker("rebase");
-    return;
-   }
-   if (id === "abandon" || id === "squash") runBulk(id, targets);
-  },
-  [runBulk, targets],
- );
+/** Runs one verb from the bulk list. The two that act where they are go at
+  *  once; a rebase needs a destination, so it hands the selection to the
+  *  picker and comes back when there is one. */
+const runBulkAction = useCallback(
+ (id: RevisionActionId) => {
+  if (id === "rebase") {
+   setPickerTargets(targets);
+   setPicker("rebase");
+   return;
+  }
+  if (id === "abandon" || id === "squash") runBulk(id, targets);
+ },
+ [runBulk, targets],
+);
 
- const renderRow = useCallback(
-  ({ item }: { item: DiffRow }) => {
-   if (item.kind === "file") {
-    return (
-     <FileHeader
-      file={item.file}
-      palette={palette}
-      metrics={metrics}
-      compact={layout.compact}
-      onRevert={revset === "@" ? () => setPendingRevert(item.file.path) : undefined}
-     />
-    );
-   }
-   if (item.kind === "hunk") return <HunkHeader header={item.header} palette={palette} metrics={metrics} />;
-   if (item.kind === "line") return <UnifiedLine line={item.line} palette={palette} metrics={metrics} />;
-   if (item.kind === "split") {
-    return <SplitLine left={item.left} right={item.right} palette={palette} metrics={metrics} />;
-   }
-   return <NoteRow text={item.text} palette={palette} metrics={metrics} />;
-  },
-  [palette, metrics, layout.compact, revset],
- );
 
  if (directory === null) {
   return (
@@ -1109,40 +1097,24 @@ const askWhereCheckedGo = useCallback(() => {
     onPointerLeave={endDrag}
     onPointerCancel={endDrag}
    >
-    {treeVisible && layout.compact ? null : (
-     <FlatList
-      ref={listRef}
-      style={styles.list}
-      testID="jj-diff"
-      data={rows}
-      keyExtractor={(item) => item.key}
-      renderItem={renderRow}
-      initialNumToRender={30}
-      maxToRenderPerBatch={30}
-      windowSize={11}
-      removeClippedSubviews
-      onScrollToIndexFailed={(info) => {
-       // Rows are variable height, so an unmeasured index cannot be scrolled
-       // to directly. Estimate, then retry once the row has been rendered.
-       listRef.current?.scrollToOffset({
-        offset: info.averageItemLength * info.index,
-        animated: false,
-       });
-       setTimeout(() => {
-        listRef.current?.scrollToIndex({ index: info.index, animated: true });
-       }, 120);
-      }}
-      ListEmptyComponent={
-       <View style={styles.center}>
-        <Text style={styles.muted}>
-         {diffQuery.isPending
-          ? "Loading the diff…"
-          : isEmpty
-           ? "This change is empty. Edits an agent makes will appear here."
-           : "No content changes in this revision."}
-        </Text>
-       </View>
-      }
+    {treeVisible && layout.compact ? null : orderedFiles.length === 0 ? (
+     <View style={styles.center}>
+      <Text style={styles.muted}>
+       {diffQuery.isPending
+        ? "Loading the diff…"
+        : isEmpty
+         ? "This change is empty. Edits an agent makes will appear here."
+         : "No content changes in this revision."}
+      </Text>
+     </View>
+    ) : (
+     <PierreDiffView
+      files={orderedFiles}
+      split={split}
+      palette={palette}
+      onRevertFile={revset === "@" ? setPendingRevert : undefined}
+      onHunkAction={onHunkAction}
+      handleRef={diffRef}
      />
     )}
 

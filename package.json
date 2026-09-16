@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "tsx server/diff.test.ts && tsx server/tokenize.test.ts && tsx client/rows.test.ts && tsx client/file-tree.test.ts && tsx client/revision-graph.test.ts && tsx client/panel-layout.test.ts && tsx client/gestures.test.ts",
+    "test": "tsx server/diff.test.ts && tsx server/tokenize.test.ts && tsx client/pierre-patch.test.ts && tsx client/file-tree.test.ts && tsx client/revision-graph.test.ts && tsx client/panel-layout.test.ts && tsx client/gestures.test.ts",
     "test:integration": "tsx server/integration.test.ts"
   },
   "devDependencies": {
@@ -17,5 +17,8 @@
     "tsx": "^4.23.13",
     "typescript": "^5.9.3",
     "zod": "^4.4.3"
+  },
+  "dependencies": {
+    "@pierre/diffs": "1.4.2"
   }
 }
