@@ -3,10 +3,13 @@ import { useRpc, useWorkspace } from "@getpaseo/plugin/client";
 import { Icon, useToast } from "@getpaseo/plugin/client/react-native";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useMemo, useRef, useState } from "react";
-import { FlatList, Pressable, ScrollView, Text, TextInput, View } from "react-native";
+import { FlatList, Pressable, Text, TextInput, View } from "react-native";
 import { actionRpc, diffRpc, snapshotRpc } from "../shared/contracts";
 import { FileHeader, HunkHeader, NoteRow, SplitLine, UnifiedLine, monoFont } from "./diff-view";
+import { buildFileTree, orderFiles } from "./file-tree";
+import { FileTreeRail } from "./file-tree-rail";
 import { buildPalette } from "./palette";
+import { buildRevisionOptions, RevisionPickerOverlay, RevisionTrigger } from "./revision-picker";
 import { buildRows, type DiffRow } from "./rows";
 
 /**
@@ -34,6 +37,10 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
  const [split, setSplit] = useState(!layout.compact);
  const [message, setMessage] = useState("");
  const [pendingRevert, setPendingRevert] = useState<string | null>(null);
+ const [pickerOpen, setPickerOpen] = useState(false);
+ const [collapsedFolders, setCollapsedFolders] = useState<ReadonlySet<string>>(new Set());
+ const [treeVisible, setTreeVisible] = useState(!layout.compact);
+ const [selectedPath, setSelectedPath] = useState<string | null>(null);
 
  const palette = useMemo(() => buildPalette(theme), [theme]);
  const metrics = useMemo(
@@ -78,19 +85,32 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
 
  const snapshot = snapshotQuery.data;
  const files = useMemo(() => diffQuery.data?.files ?? [], [diffQuery.data]);
- const { rows, fileRowIndex } = useMemo(() => buildRows(files, split), [files, split]);
+ // The tree is the ordering authority for both surfaces: the rail lists files
+ // in this sequence and the diff renders it, so a row can never scroll to a
+ // file that sits somewhere else in the list.
+ const orderedFiles = useMemo(() => orderFiles(files), [files]);
+ const fileTree = useMemo(() => buildFileTree(files, collapsedFolders), [files, collapsedFolders]);
+ const { rows, fileRowIndex } = useMemo(() => buildRows(orderedFiles, split), [orderedFiles, split]);
+ const revisionOptions = useMemo(
+  () =>
+   buildRevisionOptions({
+    current: snapshot?.current ?? null,
+    parent: snapshot?.parent ?? null,
+    recent: snapshot?.recent ?? [],
+    bookmarks: snapshot?.bookmarks ?? [],
+   }),
+  [snapshot],
+ );
+ const revisionName = revisionOptions.find((option) => option.id === revset)?.label ?? revset;
+ const allCollapsed =
+  fileTree.folderPaths.length > 0 &&
+  fileTree.folderPaths.every((path) => collapsedFolders.has(path));
 
  const styles = useMemo(
   () => ({
    screen: { flex: 1, backgroundColor: theme.colors.surface0 },
    header: { paddingHorizontal: layout.compact ? 12 : 16, paddingTop: 12, paddingBottom: 6, gap: 6 },
    row: { flexDirection: "row" as const, alignItems: "center" as const, gap: 6 },
-   wrapRow: {
-    flexDirection: "row" as const,
-    alignItems: "center" as const,
-    gap: 6,
-    flexWrap: "wrap" as const,
-   },
    changeId: { color: palette.filePathMuted, fontSize: metrics.fontSize, fontFamily: metrics.fontFamily },
    description: {
     color: palette.filePath,
@@ -108,8 +128,6 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
    chipActive: { backgroundColor: theme.colors.accent, borderColor: theme.colors.accent },
    chipText: { fontSize: metrics.fontSize, color: palette.filePathMuted },
    chipTextActive: { color: theme.colors.accentForeground, fontSize: metrics.fontSize },
-   strip: { flexGrow: 0 },
-   stripRow: { flexDirection: "row" as const, alignItems: "center" as const, gap: 6 },
    toolbar: {
     flexDirection: "row" as const,
     alignItems: "center" as const,
@@ -133,6 +151,17 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
    buttonText: { color: palette.filePath, fontSize: metrics.fontSize },
    buttonTextPrimary: { color: theme.colors.accentForeground, fontSize: metrics.fontSize },
    disabled: { opacity: 0.45 },
+   buttonActive: { backgroundColor: theme.colors.accent, borderColor: theme.colors.accent },
+   buttonTextActive: { color: theme.colors.accentForeground, fontSize: metrics.fontSize },
+   body: { flex: 1, flexDirection: "row" as const, minHeight: 0 },
+   list: { flex: 1 },
+   rail: {
+    width: 240,
+    flexShrink: 0,
+    borderLeftWidth: 1,
+    borderColor: palette.splitDivider,
+   },
+   railWide: { flex: 1 },
    composer: {
     borderTopWidth: 1,
     borderColor: palette.splitDivider,
@@ -188,6 +217,34 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
   },
   [fileRowIndex],
  );
+
+ const selectFile = useCallback(
+  (path: string) => {
+   setSelectedPath(path);
+   scrollToFile(path);
+   // On a narrow pane the tree replaces the diff, so a picked file is done and
+   // the reader wants the diff back.
+   if (layout.compact) setTreeVisible(false);
+  },
+  [layout.compact, scrollToFile],
+ );
+
+ const toggleFolder = useCallback((path: string) => {
+  setCollapsedFolders((folders) => {
+   const next = new Set(folders);
+   if (next.has(path)) next.delete(path);
+   else next.add(path);
+   return next;
+  });
+ }, []);
+
+ const toggleCollapseAll = useCallback(() => {
+  setCollapsedFolders((folders) => {
+   const allClosed =
+    fileTree.folderPaths.length > 0 && fileTree.folderPaths.every((path) => folders.has(path));
+   return allClosed ? new Set<string>() : new Set(fileTree.folderPaths);
+  });
+ }, [fileTree.folderPaths]);
 
  const renderRow = useCallback(
   ({ item }: { item: DiffRow }) => {
@@ -310,61 +367,34 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
    ) : null}
 
    <View style={styles.toolbar}>
-    <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.strip}>
-     <View style={styles.stripRow}>
-      {[
-       { id: "@", label: "working copy" },
-       { id: "@-", label: "parent" },
-       ...snapshot.recent
-        .filter((change) => change.changeId !== current?.changeId)
-        .slice(0, 15)
-        .map((change) => ({
-         id: change.changeId,
-         label: change.description.trim() || change.changeId.slice(0, 8),
-        })),
-      ].map((option) => (
-       <Pressable
-        key={option.id}
-        accessibilityRole="button"
-        accessibilityLabel={`Show diff for ${option.label}`}
-        onPress={() => setRevset(option.id)}
-        style={[styles.chip, revset === option.id ? styles.chipActive : null]}
-       >
-        <Text
-         style={revset === option.id ? styles.chipTextActive : styles.chipText}
-         numberOfLines={1}
-        >
-         {option.label.slice(0, 40)}
-        </Text>
-       </Pressable>
-      ))}
-     </View>
-    </ScrollView>
+    <RevisionTrigger
+     label={revisionName}
+     open={pickerOpen}
+     onPress={() => setPickerOpen(true)}
+     palette={palette}
+     theme={theme}
+     metrics={metrics}
+     maxWidth={layout.compact ? 150 : 240}
+    />
    </View>
 
-   {files.length > 1 ? (
-    <View style={styles.toolbar}>
-     <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.strip}>
-      <View style={styles.stripRow}>
-       {files.map((file) => (
-        <Pressable
-         key={file.path}
-         accessibilityRole="button"
-         accessibilityLabel={`Jump to ${file.path}`}
-         onPress={() => scrollToFile(file.path)}
-         style={styles.chip}
-        >
-         <Text style={styles.chipText} numberOfLines={1}>
-          {file.path.split("/").pop()}
-         </Text>
-        </Pressable>
-       ))}
-      </View>
-     </ScrollView>
-    </View>
-   ) : null}
-
    <View style={styles.toolbar}>
+    <Pressable
+     accessibilityRole="button"
+     accessibilityLabel={treeVisible ? "Hide the file tree" : "Show the file tree"}
+     onPress={() => setTreeVisible((value) => !value)}
+     style={[styles.button, treeVisible ? styles.buttonActive : null]}
+    >
+     <Icon
+      name="ListTree"
+      size={14}
+      color={treeVisible ? theme.colors.accentForeground : palette.filePath}
+     />
+     <Text style={treeVisible ? styles.buttonTextActive : styles.buttonText}>
+      {layout.compact && treeVisible ? "Diff" : "Files"}
+     </Text>
+    </Pressable>
+
     <Pressable
      accessibilityRole="button"
      accessibilityLabel={split ? "Switch to unified diff" : "Switch to split diff"}
@@ -426,38 +456,62 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
     </View>
    ) : null}
 
-   <FlatList
-    ref={listRef}
-    data={rows}
-    keyExtractor={(item) => item.key}
-    renderItem={renderRow}
-    initialNumToRender={30}
-    maxToRenderPerBatch={30}
-    windowSize={11}
-    removeClippedSubviews
-    onScrollToIndexFailed={(info) => {
-     // Rows are variable height, so an unmeasured index cannot be scrolled
-     // to directly. Estimate, then retry once the row has been rendered.
-     listRef.current?.scrollToOffset({
-      offset: info.averageItemLength * info.index,
-      animated: false,
-     });
-     setTimeout(() => {
-      listRef.current?.scrollToIndex({ index: info.index, animated: true });
-     }, 120);
-    }}
-    ListEmptyComponent={
-     <View style={styles.center}>
-      <Text style={styles.muted}>
-       {diffQuery.isPending
-        ? "Loading the diff…"
-        : isEmpty
-         ? "This change is empty. Edits an agent makes will appear here."
-         : "No content changes in this revision."}
-      </Text>
+   <View style={styles.body}>
+    {treeVisible && layout.compact ? null : (
+     <FlatList
+      ref={listRef}
+      style={styles.list}
+      testID="jj-diff"
+      data={rows}
+      keyExtractor={(item) => item.key}
+      renderItem={renderRow}
+      initialNumToRender={30}
+      maxToRenderPerBatch={30}
+      windowSize={11}
+      removeClippedSubviews
+      onScrollToIndexFailed={(info) => {
+       // Rows are variable height, so an unmeasured index cannot be scrolled
+       // to directly. Estimate, then retry once the row has been rendered.
+       listRef.current?.scrollToOffset({
+        offset: info.averageItemLength * info.index,
+        animated: false,
+       });
+       setTimeout(() => {
+        listRef.current?.scrollToIndex({ index: info.index, animated: true });
+       }, 120);
+      }}
+      ListEmptyComponent={
+       <View style={styles.center}>
+        <Text style={styles.muted}>
+         {diffQuery.isPending
+          ? "Loading the diff…"
+          : isEmpty
+           ? "This change is empty. Edits an agent makes will appear here."
+           : "No content changes in this revision."}
+        </Text>
+       </View>
+      }
+     />
+    )}
+
+    {treeVisible ? (
+     <View style={layout.compact ? styles.railWide : styles.rail}>
+      <FileTreeRail
+       rows={fileTree.rows}
+       collapsed={collapsedFolders}
+       selectedPath={selectedPath}
+       allCollapsed={allCollapsed}
+       loading={diffQuery.isPending}
+       onToggleFolder={toggleFolder}
+       onToggleCollapseAll={toggleCollapseAll}
+       onSelectFile={selectFile}
+       palette={palette}
+       metrics={metrics}
+       theme={theme}
+      />
      </View>
-    }
-   />
+    ) : null}
+   </View>
 
    {pendingRevert ? (
     <View style={styles.confirmBar}>
@@ -522,6 +576,23 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
       </Pressable>
      </View>
     </View>
+   ) : null}
+
+   {pickerOpen ? (
+    <RevisionPickerOverlay
+     options={revisionOptions}
+     value={revset}
+     onSelect={(id) => {
+      setRevset(id);
+      setPickerOpen(false);
+      setSelectedPath(null);
+     }}
+     onClose={() => setPickerOpen(false)}
+     palette={palette}
+     theme={theme}
+     metrics={metrics}
+     compact={layout.compact}
+    />
    ) : null}
   </View>
  );
