@@ -46,7 +46,9 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
  const listRef = useRef<FlatList<DiffRow>>(null);
 
  const [revset, setRevset] = useState("@");
- const [split, setSplit] = useState(!layout.compact);
+ // Unified reads top to bottom and needs no horizontal room, which is what this
+ // pane usually has. Split stays a click away on a wide layout.
+ const [split, setSplit] = useState(false);
  const [message, setMessage] = useState("");
  const [pendingRevert, setPendingRevert] = useState<string | null>(null);
  const [picker, setPicker] = useState<RevisionPickerPurpose | null>(null);
