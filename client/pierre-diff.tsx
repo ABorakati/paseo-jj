@@ -2,9 +2,11 @@ import { CodeView, EditProvider, Editor } from "./vendor/pierre.js";
 import type {
  CodeViewHandle,
  CodeViewItem,
+ DiffLineAnnotation,
  EditCompletionDecision,
  EditorFactory,
  FileDiffEditCompleteEvent,
+ FileDiffMetadata,
  FileEditCompleteEvent,
 } from "./vendor/pierre.js";
 import type { CSSProperties, Ref } from "react";
@@ -13,18 +15,18 @@ import { View } from "react-native";
 import type { JjFileDiff } from "../shared/contracts";
 import type { DiffPalette } from "./palette";
 import { noteFor } from "./pierre-patch";
-import { parseFile } from "./pierre-parse";
+import { parseAddedFile, parseFile } from "./pierre-parse";
 
 /**
- * What a hunk control asks for. `file` is the path exactly as `JjFileDiff.path`
- * carries it, and `hunkIndex` counts hunks in the parsed diff, in the order jj
- * emitted them — not a rendered row. Both name the same hunk the server parses
- * out of `jj diff`, so a caller can hand the pair straight to a jj command.
+ * One hunk to move out of the revision on screen and into its parent. `file` is
+ * the path exactly as `JjFileDiff.path` carries it, and `hunkIndex` counts hunks
+ * in the parsed diff, in the order jj emitted them — not a rendered row. Both
+ * name the same hunk the server parses out of `jj diff`, so a caller can hand
+ * the pair straight to a jj command.
  */
 export interface HunkActionInput {
  file: string;
  hunkIndex: number;
- kind: "accept" | "reject";
 }
 
 /** The panel drives the diff list through this, the way it used the FlatList. */
@@ -49,12 +51,18 @@ export interface FileEditAccess {
   content: string;
   expected: string;
  }): Promise<{ ok: boolean; error: string | null }>;
+ /** Says why an editor could not open, when reading the file failed. */
+ refused(message: string): void;
 }
 
 interface PierreDiffViewProps {
  files: JjFileDiff[];
  split: boolean;
  palette: DiffPalette;
+ /** Paths whose body is shown. Every other file renders as its header only, so
+  *  a long change reads as a list first and opens one file at a time. */
+ expanded: ReadonlySet<string>;
+ onToggleExpanded(path: string): void;
  /** Omitted outside the working copy, where a revert has nothing to undo. */
  onRevertFile?: (path: string) => void;
  onHunkAction?: (input: HunkActionInput) => void;
@@ -63,24 +71,76 @@ interface PierreDiffViewProps {
  handleRef?: Ref<PierreDiffHandle>;
 }
 
-type EditEvent =
- | FileEditCompleteEvent<undefined, undefined>
- | FileDiffEditCompleteEvent<undefined, undefined>;
+/** What a hunk's annotation carries: which hunk its control moves. */
+interface HunkNote {
+ hunkIndex: number;
+}
 
-const NOTE_STYLE: CSSProperties = { fontSize: 11, opacity: 0.75 };
-const HUNK_ROW_STYLE: CSSProperties = { display: "flex", gap: 2, alignItems: "center" };
-const HUNK_LABEL_STYLE: CSSProperties = { fontSize: 11, opacity: 0.75 };
+type EditEvent =
+ | FileEditCompleteEvent<HunkNote, undefined>
+ | FileDiffEditCompleteEvent<HunkNote, undefined>;
+
+/** The note gives way to the buttons: it shrinks to an ellipsis on one line,
+ *  so the header never wraps below the file name. */
+const NOTE_STYLE: CSSProperties = {
+ fontSize: 11,
+ opacity: 0.75,
+ minWidth: 0,
+ overflow: "hidden",
+ textOverflow: "ellipsis",
+ whiteSpace: "nowrap",
+};
+const HUNK_CONTROL_STYLE: CSSProperties = {
+ display: "flex",
+ justifyContent: "flex-end",
+ padding: "2px 12px",
+};
+/** Two clicks on one file within this window open its editor. */
+const DOUBLE_CLICK_MS = 450;
 
 /**
- * The editor works on a file pair, and Pierre hydrates a patch-parsed diff from
- * one only when the file changed or was renamed. A file this change added or
- * removed has no pair to build, so the header says that instead of offering a
- * control that would do nothing.
+ * Each hunk's control sits under the hunk's last line, so the button is read
+ * as belonging to the lines above it. A hunk ending in a removal has no new-side
+ * line there, so its annotation is placed on the old side instead.
+ */
+function hunkAnnotations(file: JjFileDiff): DiffLineAnnotation<HunkNote>[] {
+ const annotations: DiffLineAnnotation<HunkNote>[] = [];
+ file.hunks.forEach((hunk, hunkIndex) => {
+  const last = hunk.lines[hunk.lines.length - 1];
+  if (last === undefined) return;
+  if (last.kind === "remove" && last.oldLine !== null) {
+   annotations.push({ side: "deletions", lineNumber: last.oldLine, metadata: { hunkIndex } });
+  } else if (last.newLine !== null) {
+   annotations.push({ side: "additions", lineNumber: last.newLine, metadata: { hunkIndex } });
+  }
+ });
+ return annotations;
+}
+
+/**
+ * CodeView redraws an item only when its version changes, so the version has to
+ * move with everything the item shows. A refetch keeps an unchanged file's
+ * object (react-query shares equal data), so object identity is the content
+ * identity: a new object is a new serial, and an old one keeps its own.
+ */
+const contentSerials = new WeakMap<JjFileDiff, number>();
+let nextSerial = 1;
+function contentSerial(file: JjFileDiff): number {
+ let serial = contentSerials.get(file);
+ if (serial === undefined) {
+  serial = nextSerial++;
+  contentSerials.set(file, serial);
+ }
+ return serial;
+}
+
+/**
+ * What cannot be edited, and the sentence that says so. A removed file has no
+ * new side to type into, and a binary one has no text.
  */
 function editBlocker(file: JjFileDiff): string | null {
  if (file.binary) return "Binary file — no text diff.";
  if (file.status === "removed") return "Deleted in this change — nothing to edit.";
- if (file.status === "added") return "New file — the editor opens files this change modified.";
  if (file.hunks.length === 0) return "No content changes.";
  return null;
 }
@@ -88,48 +148,70 @@ function editBlocker(file: JjFileDiff): string | null {
 /**
  * The diff surface. Pierre owns rendering, layout and highlighting; this module
  * owns what the panel needs on top: which jj file a rendered item is, the
- * per-hunk controls, and the inline edit that writes back through the panel.
+ * per-hunk controls, which files are open, and the inline edit that writes back
+ * through the panel. A double click on a line opens that file's editor.
  */
 export const PierreDiffView = memo(function PierreDiffView({
  files,
  split,
  palette,
+ expanded,
+ onToggleExpanded,
  onRevertFile,
  onHunkAction,
  edit,
  handleRef,
 }: PierreDiffViewProps) {
- const viewRef = useRef<CodeViewHandle<undefined, undefined>>(null);
+ const viewRef = useRef<CodeViewHandle<HunkNote, undefined>>(null);
  /** The file whose text is open in the editor, if any. */
  const [editing, setEditing] = useState<string | null>(null);
  /**
-  * Bumped whenever an edit settles. The item version is what CodeView compares
-  * to decide an item's value changed, so this is what drops the edited text and
-  * re-reads the file after a save or a refusal.
+  * Bumped whenever an edit settles, so the item redraws from the file on disk
+  * after a save or a refusal even when the diff text itself did not change.
   */
  const [epoch, setEpoch] = useState(0);
  /** The text each read returned, which is what a write is checked against. */
  const readText = useRef(new Map<string, string>());
  /** Whether the session that is ending asked to be written. */
  const saving = useRef(false);
+ /** Each path's last drawn state and the version it was given. */
+ const versions = useRef(new Map<string, { key: string; version: number }>());
+ /** The previous line click, which a second click on the same file completes. */
+ const lastClick = useRef<{ path: string; at: number } | null>(null);
+ /** Where the double click that opened the editor landed, so the caret starts
+  *  there once the editor attaches. Null for a line the new file does not have. */
+ const caretLine = useRef<number | null>(null);
+ /** Added files opened for editing, hydrated with their text. Pierre loads the
+  *  file pair on its own only for a changed or renamed file. */
+ const addedDiffs = useRef(new Map<string, FileDiffMetadata>());
 
- const items = useMemo<CodeViewItem<undefined>[]>(
+ const items = useMemo<CodeViewItem<HunkNote>[]>(
   () =>
    files.map((file) => {
     const open = editing === file.path;
+    // A single file has nothing to list, so it is shown open.
+    const collapsed = !open && files.length > 1 && !expanded.has(file.path);
+    // The version is a counter per path that moves whenever anything the item
+    // shows moves: its content, its edit mode, whether it is open, or a
+    // settled edit. CodeView keeps whatever it drew while the version stands.
+    const key = `${contentSerial(file)}:${open}:${collapsed}:${epoch}:${onHunkAction !== undefined}`;
+    const previous = versions.current.get(file.path);
+    const version =
+     previous === undefined ? 1 : previous.key === key ? previous.version : previous.version + 1;
+    versions.current.set(file.path, { key, version });
     return {
      // The path is the item id, which is what the file tree rail scrolls to.
      id: file.path,
      type: "diff" as const,
-     // CodeView takes an item's value as changed when its version changes, and
-     // the edit flag is one of those values: opening or closing the editor has
-     // to move the version, or the item keeps whatever mode it was mounted in.
-     version: epoch + (open ? 1 : 0),
+     version,
+     collapsed,
      edit: edit !== undefined && open && editBlocker(file) === null,
-     fileDiff: parseFile(file),
+     // The hunk controls stand under their hunks; an open editor has no hunks.
+     annotations: onHunkAction === undefined || open ? undefined : hunkAnnotations(file),
+     fileDiff: (open ? addedDiffs.current.get(file.path) : undefined) ?? parseFile(file),
     };
    }),
-  [files, edit, editing, epoch],
+  [files, edit, editing, epoch, expanded, onHunkAction],
  );
 
  const sources = useMemo(() => new Map(files.map((file) => [file.path, file])), [files]);
@@ -147,6 +229,64 @@ export const PierreDiffView = memo(function PierreDiffView({
   [edit],
  );
 
+ /**
+  * A double click on a line opens that file's editor. Pierre reports single
+  * clicks, so the second click on the same file within the window completes
+  * the pair; a click on another file starts a new one.
+  */
+ const onLineClick = useCallback(
+  (
+   props: { lineNumber: number; annotationSide?: "deletions" | "additions" },
+   context: { item: CodeViewItem<HunkNote> },
+  ) => {
+   const path = context.item.id;
+   const now = Date.now();
+   const previous = lastClick.current;
+   const isDouble =
+    previous !== null && previous.path === path && now - previous.at < DOUBLE_CLICK_MS;
+   lastClick.current = isDouble ? null : { path, at: now };
+   if (!isDouble || edit === undefined || editing === path) return;
+   const source = sources.get(path);
+   if (source === undefined || editBlocker(source) !== null) return;
+   // The editor holds the new file, so a removed line has no place in it.
+   caretLine.current = props.annotationSide === "deletions" ? null : props.lineNumber;
+   saving.current = false;
+   if (source.status !== "added") {
+    setEditing(path);
+    return;
+   }
+   // An added file's text is read before the editor opens, so Pierre gets a
+   // diff it can edit instead of one it would wait on forever.
+   const access = edit;
+   void access
+    .read(path)
+    .then((sides) => {
+     readText.current.set(path, sides.newText);
+     addedDiffs.current.set(path, parseAddedFile(source, sides.newText));
+     setEditing(path);
+    })
+    .catch((error: unknown) => {
+     access.refused(error instanceof Error ? error.message : `Could not read ${path}.`);
+    });
+  },
+  [edit, editing, sources],
+ );
+
+ /**
+  * The editor attaches after its file loads, which is the first moment a caret
+  * can be placed: without one, typing has nowhere to go until another click.
+  */
+ const editorOptions = useMemo(
+  () => ({
+   onAttach(editor: { focus(options?: { lineNumber?: number | "first-visible" }): void }) {
+    const lineNumber = caretLine.current ?? "first-visible";
+    caretLine.current = null;
+    requestAnimationFrame(() => editor.focus({ lineNumber }));
+   },
+  }),
+  [],
+ );
+
  const options = useMemo(
   () => ({
    diffStyle: split ? ("split" as const) : ("unified" as const),
@@ -154,11 +294,12 @@ export const PierreDiffView = memo(function PierreDiffView({
    // The diff arrives as hunks, so the editor can only be opened once Pierre
    // has the file pair this hands it.
    loadDiffFiles: edit === undefined ? undefined : loadDiffFiles,
+   onLineClick,
   }),
-  [split, palette.isDark, edit, loadDiffFiles],
+  [split, palette.isDark, edit, loadDiffFiles, onLineClick],
  );
 
- const createEditor = useCallback<EditorFactory<undefined, undefined>>(
+ const createEditor = useCallback<EditorFactory<HunkNote, undefined>>(
   (type, editorOptions, editStateKey) => new Editor(type, editorOptions, editStateKey),
   [],
  );
@@ -168,6 +309,7 @@ export const PierreDiffView = memo(function PierreDiffView({
    const wantsWrite = saving.current;
    saving.current = false;
    setEditing(null);
+   addedDiffs.current.delete(path);
    if (!wantsWrite || edit === undefined || contents === undefined) return;
    void edit
     .write({ path, content: contents, expected: readText.current.get(path) ?? "" })
@@ -177,10 +319,11 @@ export const PierreDiffView = memo(function PierreDiffView({
  );
 
  const onItemEditComplete = useCallback(
-  function completeItemEdit(event: EditEvent, item: CodeViewItem<undefined>): EditCompletionDecision {
+  function completeItemEdit(event: EditEvent, item: CodeViewItem<HunkNote>): EditCompletionDecision {
    if (!("newFile" in event) || event.newFile === null) {
     // A file item, or a deleted file: there is no new text to write.
     setEditing(null);
+    addedDiffs.current.clear();
     saving.current = false;
     return "reject";
    }
@@ -195,7 +338,8 @@ export const PierreDiffView = memo(function PierreDiffView({
  const headerStyle = useMemo<CSSProperties>(
   () => ({
    display: "flex",
-   flexWrap: "wrap",
+   flexWrap: "nowrap",
+   minWidth: 0,
    gap: 6,
    alignItems: "center",
    justifyContent: "flex-end",
@@ -215,17 +359,39 @@ export const PierreDiffView = memo(function PierreDiffView({
    background: palette.contextRow,
    color: palette.filePathMuted,
    cursor: "pointer",
+   flexShrink: 0,
+   whiteSpace: "nowrap",
   }),
   [palette.splitDivider, palette.contextRow, palette.filePathMuted],
  );
 
+ /** The chevron that opens and closes a file, ahead of its name. */
+ const renderHeaderPrefix = useCallback(
+  (item: CodeViewItem<HunkNote>) => {
+   if (files.length <= 1 || editing === item.id) return null;
+   const open = expanded.has(item.id);
+   return (
+    <button
+     type="button"
+     style={{ ...buttonStyle, border: "none", background: "transparent", padding: "0 4px" }}
+     aria-label={`${open ? "Collapse" : "Expand"} ${item.id}`}
+     aria-expanded={open}
+     onClick={() => onToggleExpanded(item.id)}
+    >
+     {open ? "▾" : "▸"}
+    </button>
+   );
+  },
+  [buttonStyle, editing, expanded, files.length, onToggleExpanded],
+ );
+
  /**
-  * The file header is the one strip Pierre leaves to the host, so it carries
-  * what the diff cannot say for itself: the per-file revert, the inline edit,
-  * and one control per hunk.
+  * The file header carries what the diff cannot say for itself: the per-file
+  * revert, and Save/Cancel while the file's editor is open. Hunk controls sit
+  * under their hunks instead, where they cannot pile up in one strip.
   */
  const renderHeaderMetadata = useCallback(
-  (item: CodeViewItem<undefined>) => {
+  (item: CodeViewItem<HunkNote>) => {
    if (item.type !== "diff") return null;
    const file = item.fileDiff;
    const source = sources.get(file.name);
@@ -241,17 +407,7 @@ export const PierreDiffView = memo(function PierreDiffView({
    return (
     <div style={headerStyle}>
      {note === null ? null : <span style={NOTE_STYLE}>{note}</span>}
-     {canRevert ? (
-      <button
-       type="button"
-       style={{ ...buttonStyle, color: palette.removedCount }}
-       aria-label={`Discard changes to ${file.name}`}
-       onClick={() => onRevertFile?.(file.name)}
-      >
-       Discard
-      </button>
-     ) : null}
-     {edit === undefined || blocker !== null ? null : open ? (
+     {open ? (
       <>
        <button
         type="button"
@@ -278,59 +434,42 @@ export const PierreDiffView = memo(function PierreDiffView({
         Cancel
        </button>
       </>
-     ) : (
+     ) : canRevert ? (
       <button
        type="button"
-       style={buttonStyle}
-       title={`Type in ${file.name} and write it back to the working copy`}
-       aria-label={`Edit ${file.name} in the panel`}
-       onClick={() => {
-        saving.current = false;
-        setEditing(file.name);
-       }}
+       style={{ ...buttonStyle, color: palette.removedCount }}
+       aria-label={`Discard changes to ${file.name}`}
+       onClick={() => onRevertFile?.(file.name)}
       >
-       Edit
+       Discard
       </button>
-     )}
-     {onHunkAction === undefined
-      ? null
-      : file.hunks.map((hunk, hunkIndex) => (
-       <span key={hunk.hunkSpecs ?? hunkIndex} style={HUNK_ROW_STYLE}>
-        <span style={HUNK_LABEL_STYLE}>hunk {hunkIndex + 1}</span>
-        <button
-         type="button"
-         style={buttonStyle}
-         title={`Keep hunk ${hunkIndex + 1} in this revision`}
-         aria-label={`Accept hunk ${hunkIndex + 1} of ${file.name}`}
-         onClick={() => onHunkAction({ file: file.name, hunkIndex, kind: "accept" })}
-        >
-         keep
-        </button>
-        <button
-         type="button"
-         style={buttonStyle}
-         title={`Move hunk ${hunkIndex + 1} out of this revision and into its parent`}
-         aria-label={`Reject hunk ${hunkIndex + 1} of ${file.name}`}
-         onClick={() => onHunkAction({ file: file.name, hunkIndex, kind: "reject" })}
-        >
-         → parent
-        </button>
-       </span>
-      ))}
+     ) : null}
     </div>
    );
   },
-  [
-   sources,
-   edit,
-   editing,
-   headerStyle,
-   buttonStyle,
-   onHunkAction,
-   onRevertFile,
-   palette.removedCount,
-   palette.addedCount,
-  ],
+  [sources, edit, editing, headerStyle, buttonStyle, onRevertFile, palette.removedCount, palette.addedCount],
+ );
+
+ /** One control under each hunk: move that hunk into the parent revision. */
+ const renderAnnotation = useCallback(
+  (annotation: { metadata?: HunkNote }, item: CodeViewItem<HunkNote>) => {
+   const hunkIndex = annotation.metadata?.hunkIndex;
+   if (hunkIndex === undefined || onHunkAction === undefined) return null;
+   return (
+    <div style={HUNK_CONTROL_STYLE}>
+     <button
+      type="button"
+      style={buttonStyle}
+      title="Move the hunk above out of this revision and into its parent"
+      aria-label={`Move hunk ${hunkIndex + 1} of ${item.id} to the parent revision`}
+      onClick={() => onHunkAction({ file: item.id, hunkIndex })}
+     >
+      Move to parent
+     </button>
+    </div>
+   );
+  },
+  [buttonStyle, onHunkAction],
  );
 
  useImperativeHandle(
@@ -358,8 +497,11 @@ export const PierreDiffView = memo(function PierreDiffView({
      items={items}
      options={options}
      disableWorkerPool
+     renderHeaderPrefix={renderHeaderPrefix}
      renderHeaderMetadata={renderHeaderMetadata}
+     renderAnnotation={renderAnnotation}
      onItemEditComplete={onItemEditComplete}
+     editorOptions={editorOptions}
      style={{ flex: 1, minHeight: 0, overflowY: "auto", overflowX: "hidden" }}
     />
    </EditProvider>

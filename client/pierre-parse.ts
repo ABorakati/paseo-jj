@@ -1,4 +1,4 @@
-import { parsePatchFiles, type FileDiffMetadata } from "./vendor/pierre.js";
+import { parsePatchFiles, processFile, type FileDiffMetadata } from "./vendor/pierre.js";
 import type { JjFileDiff } from "../shared/contracts";
 import { filePatch } from "./pierre-patch";
 
@@ -32,4 +32,18 @@ function headerOnly(file: JjFileDiff): FileDiffMetadata {
  */
 export function parseFile(file: JjFileDiff): FileDiffMetadata {
  return parsePatchFiles(filePatch(file))[0]?.files[0] ?? headerOnly(file);
+}
+
+/**
+ * A file this change added, with its text attached. Pierre loads the file pair
+ * for an editor only when a file changed or was renamed, so an added file is
+ * handed over already hydrated: an empty old side and the file as the new one.
+ */
+export function parseAddedFile(file: JjFileDiff, text: string): FileDiffMetadata {
+ return (
+  processFile(filePatch(file), {
+   oldFile: { name: file.path, contents: "" },
+   newFile: { name: file.path, contents: text },
+  }) ?? headerOnly(file)
+ );
 }

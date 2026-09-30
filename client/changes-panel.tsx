@@ -1,13 +1,19 @@
 import type { RpcInput, RpcOutput } from "@getpaseo/plugin";
 import type { PluginWorkspacePanelProps } from "@getpaseo/plugin/client";
 import { useRpc, useWorkspace } from "@getpaseo/plugin/client";
-import { Icon, copyText, useToast } from "@getpaseo/plugin/client/react-native";
+import { Icon, useToast } from "@getpaseo/plugin/client/react-native";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Pressable, Text, TextInput, View } from "react-native";
 import type { PointerEvent, ViewStyle } from "react-native";
-import { actionRpc, diffRpc, snapshotRpc, writeFileRpc } from "../shared/contracts";
-import { monoFont } from "./diff-view";
+import { actionRpc, diffRpc, snapshotRpc } from "../shared/contracts";
+import {
+ bumpEpoch,
+ focusFile,
+ openDiffPane,
+ selectRevision as selectPaneRevision,
+ usePaneState,
+} from "./pane-store";
 import { buildFileTree, orderFiles } from "./file-tree";
 import { FileTreeRail } from "./file-tree-rail";
 import {
@@ -18,30 +24,16 @@ import {
  dropCall,
  dropGesture,
  type BulkVerb,
- type HeldModifiers,
 } from "./gestures";
 import { GraphView } from "./graph-view";
 import { useHeldKeys } from "./held-keys";
-import { buildPalette } from "./palette";
-import { PierreDiffView, type HunkActionInput, type PierreDiffHandle, type FileEditAccess } from "./pierre-diff";
-import { wholeFileText } from "./pierre-patch";
-import {
- SIDEBAR_INITIAL_WIDTH,
- SPLIT_INITIAL,
- draggedSidebarWidth,
- draggedSplitRatio,
-} from "./panel-layout";
+import { SPLIT_INITIAL, draggedSplitRatio } from "./panel-layout";
 import { BranchBar } from "./branch-bar";
-import { buildRevisionOptions, RevisionPickerOverlay, RevisionTrigger } from "./revision-picker";
+import { buildRevisionOptions, RevisionPickerOverlay } from "./revision-picker";
 import { RevisionActionsOverlay, type RevisionAction, type RevisionActionId } from "./revision-actions";
-import { useSquashHunks } from "./squash";
+import { paneMetrics, POLL_MS } from "./pane-shared";
+import { buildPalette } from "./palette";
 
-/**
- * The working copy changes under the panel as agents edit files, so the
- * snapshot and diff are polled. jj snapshots incrementally, which keeps the
- * repeat cost well below the first read of a repository.
- */
-const POLL_MS = 5000;
 
 /** The picker is reused for the branch actions: the title and what a pick means
  *  change, the searchable list does not. */
@@ -59,7 +51,6 @@ const PICKER_TITLE: Record<RevisionPickerPurpose, string> = {
  *  a handle with no cursor reads as a plain border, and one that lets the
  *  browser start a text selection loses the gesture to a native drag. Applied
  *  on the web host only, so a native build never sees the unknown keys. */
-const WIDTH_HANDLE = { cursor: "col-resize", userSelect: "none" } as unknown as ViewStyle;
 const HEIGHT_HANDLE = { cursor: "row-resize", userSelect: "none" } as unknown as ViewStyle;
 
 /** The history verbs, in the order they are reached for. A verb that can leave
@@ -171,31 +162,21 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
  const callSnapshot = useRpc(snapshotRpc);
  const callDiff = useRpc(diffRpc);
  const callAction = useRpc(actionRpc);
- const callWriteFile = useRpc(writeFileRpc);
  const toast = useToast();
  const queryClient = useQueryClient();
- const diffRef = useRef<PierreDiffHandle>(null);
 
- const [revset, setRevset] = useState("@");
- // Unified reads top to bottom and needs no horizontal room, which is what this
- // pane usually has. Split stays a click away on a wide layout.
- const [split, setSplit] = useState(false);
+ const paneState = usePaneState(workspaceId);
+ const { revset, epoch } = paneState;
  const [message, setMessage] = useState("");
- const [pendingRevert, setPendingRevert] = useState<string | null>(null);
  const [picker, setPicker] = useState<RevisionPickerPurpose | null>(null);
- /** The revisions a pick from the picker acts on when the picker was opened
-  *  from a bulk verb: it cannot carry a list, and Escape may empty the
-  *  selection while it is up, which must not quietly narrow the verb. */
  const [pickerTargets, setPickerTargets] = useState<string[] | null>(null);
  const [bookmarkName, setBookmarkName] = useState("");
  const [pendingBookmarkDelete, setPendingBookmarkDelete] = useState<string | null>(null);
  const [collapsedFolders, setCollapsedFolders] = useState<ReadonlySet<string>>(new Set());
- const [treeVisible, setTreeVisible] = useState(!layout.compact);
- const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_INITIAL_WIDTH);
  const [filesMinimized, setFilesMinimized] = useState(false);
  const [revisionsMinimized, setRevisionsMinimized] = useState(false);
- const [splitRatio, setSplitRatio] = useState(SPLIT_INITIAL);
  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+ const [splitRatio, setSplitRatio] = useState(SPLIT_INITIAL);
  /** Paths picked in the tree, for a move into another revision. */
  const [checkedPaths, setCheckedPaths] = useState<ReadonlySet<string>>(new Set());
  const [actionsOpen, setActionsOpen] = useState(false);
@@ -226,17 +207,13 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
  const held = useHeldKeys(layout.platform === "web", clearSelection);
 
  /** A drag is measured against the size at the moment the press happened. */
- const sidebarWidthRef = useRef(sidebarWidth);
  const splitRatioRef = useRef(splitRatio);
- const sidebarHeightRef = useRef(0);
- /** Live drags; null when nothing is being dragged. */
- const sidebarDrag = useRef<{ startX: number; startWidth: number } | null>(null);
+ const splitHeightRef = useRef(0);
  const splitDrag = useRef<{ startY: number; startRatio: number } | null>(null);
 
  useEffect(() => {
-  sidebarWidthRef.current = sidebarWidth;
   splitRatioRef.current = splitRatio;
- }, [sidebarWidth, splitRatio]);
+ }, [splitRatio]);
 
  /**
   * The drag is tracked on the pane that contains the handle rather than on the
@@ -271,51 +248,30 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
    return;
   }
 
-  const sidebar = sidebarDrag.current;
-  if (sidebar) {
-   const deltaX = pageX - sidebar.startX;
-   if (Math.abs(deltaX) >= 2) {
-    setSidebarWidth(draggedSidebarWidth(sidebar.startWidth, deltaX));
-   }
-   return;
-  }
-  const split = splitDrag.current;
-  if (split) {
+  if (splitDrag.current) {
+   const split = splitDrag.current;
    const deltaY = pageY - split.startY;
    if (Math.abs(deltaY) >= 2) {
-    setSplitRatio(draggedSplitRatio(split.startRatio, deltaY, sidebarHeightRef.current));
+    setSplitRatio(draggedSplitRatio(split.startRatio, deltaY, splitHeightRef.current));
    }
   }
  };
 
  const endDrag = () => {
-  sidebarDrag.current = null;
   splitDrag.current = null;
   const revision = dragRef.current;
   dragRef.current = null;
   if (!revision) return;
   setDrag(null);
-  // Below the threshold nothing was dragged, so the press stays the click the
-  // row's own handler turns into a selection.
   if (!revision.active) return;
   suppressSelect.current = true;
   const target = revision.targetId;
   if (target === null || target === revision.changeId) return;
   if (revision.bookmark !== null) {
-   // A bookmark pill dropped on a row is the one drop that moves a name rather
-   // than history, so it takes the same verb the bookmark field does.
-   runAction.mutate({
-    directory: directory ?? "",
-    action: "bookmark-set",
-    name: revision.bookmark,
-    revset: target,
-   });
+   runAction.mutate({ directory: directory ?? "", action: "bookmark-set", name: revision.bookmark, revset: target });
    return;
   }
-  runAction.mutate({
-   directory: directory ?? "",
-   ...dropCall(dropGesture(held), revision.changeId, target),
-  });
+  runAction.mutate({ directory: directory ?? "", ...dropCall(dropGesture(held), revision.changeId, target) });
  };
 
  /** A press that may become a drag: the row it started on, the bookmark when it
@@ -350,7 +306,7 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
  }, []);
  const palette = useMemo(() => buildPalette(theme), [theme]);
  const metrics = useMemo(
-  () => ({ fontSize: layout.compact ? 11 : 12, fontFamily: monoFont(layout.platform) }),
+  () => paneMetrics(layout.compact, layout.platform),
   [layout.compact, layout.platform],
  );
 
@@ -376,9 +332,9 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
     toast.error(result.error ?? "jj command failed.");
     return;
    }
+   bumpEpoch(workspaceId);
    toast.show(result.output || "Done", { variant: "success" });
    setMessage("");
-   setPendingRevert(null);
    await Promise.all([
     queryClient.invalidateQueries({ queryKey: ["jj", "snapshot"] }),
     queryClient.invalidateQueries({ queryKey: ["jj", "diff"] }),
@@ -408,15 +364,8 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
   onSuccess: async (results, variables) => {
    const failures = results.filter((result) => !result.ok);
    const done = results.length - failures.length;
-   if (done > 0) {
-    toast.show(`${BULK_VERB_LABELS[variables.verb]}: ${done} of ${variables.count} done`, {
-     variant: "success",
-    });
-   }
+   if (done > 0) bumpEpoch(workspaceId);
    for (const failure of failures) toast.error(failure.error ?? "jj command failed.");
-   // The rows have just been rewritten: one may be gone and another may have
-   // emptied out, so leaving them selected would aim the next verb at revisions
-   // that are no longer the ones the reader picked.
    setSelection(EMPTY_SELECTION);
    await Promise.all([
     queryClient.invalidateQueries({ queryKey: ["jj", "snapshot"] }),
@@ -427,6 +376,9 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
    toast.error(error instanceof Error ? error.message : "The daemon call failed.");
   },
  });
+ useEffect(() => {
+  void queryClient.invalidateQueries({ queryKey: ["jj"] });
+ }, [epoch, queryClient]);
 
  const snapshot = snapshotQuery.data;
  const files = useMemo(() => diffQuery.data?.files ?? [], [diffQuery.data]);
@@ -497,7 +449,6 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
   [actions, bulk, targets.length],
  );
 
- const resizeCursor = layout.platform === "web" ? WIDTH_HANDLE : undefined;
  const splitCursor = layout.platform === "web" ? HEIGHT_HANDLE : undefined;
  /** Bookmarks already on the selected revision, offered as names to reuse. */
  const selectedBookmarks =
@@ -505,76 +456,75 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
 
  const styles = useMemo(
   () => ({
-   /** `minHeight: 0` is what lets the pane be bounded by its host at all: a flex
-   *  item's automatic minimum size is its content, so without this the diff
-   *  makes the panel taller than the space it was given and nothing scrolls. */
-   screen: { flex: 1, minHeight: 0, backgroundColor: theme.colors.surface0 },
-   header: { paddingHorizontal: layout.compact ? 12 : 16, paddingTop: 12, paddingBottom: 6, gap: 6 },
-   row: { flexDirection: "row" as const, alignItems: "center" as const, gap: 6 },
-   changeId: { color: palette.filePathMuted, fontSize: metrics.fontSize, fontFamily: metrics.fontFamily },
+   screen: {
+    flex: 1,
+    minHeight: 0,
+    backgroundColor: theme.colors.surface0,
+   },
+   header: {
+    paddingHorizontal: 12,
+    paddingTop: 10,
+    paddingBottom: 6,
+   },
+   row: {
+    flexDirection: "row" as const,
+    alignItems: "center" as const,
+    gap: 6,
+   },
+   changeId: {
+    color: palette.filePathMuted,
+    fontSize: metrics.fontSize,
+    fontFamily: metrics.fontFamily,
+   },
    description: {
     color: palette.filePath,
-    fontSize: layout.compact ? 15 : 16,
+    fontSize: 14,
     fontWeight: "600" as const,
+    flex: 1,
    },
-   muted: { color: palette.filePathMuted, fontSize: metrics.fontSize },
-   chip: {
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-    borderRadius: 5,
-    borderWidth: 1,
-    borderColor: palette.splitDivider,
-   },
-   chipActive: { backgroundColor: theme.colors.accent, borderColor: theme.colors.accent },
-   chipText: { fontSize: metrics.fontSize, color: palette.filePathMuted },
-   chipTextActive: { color: theme.colors.accentForeground, fontSize: metrics.fontSize },
    toolbar: {
     flexDirection: "row" as const,
     alignItems: "center" as const,
     gap: 6,
-    paddingHorizontal: layout.compact ? 12 : 16,
-    paddingBottom: 8,
+    paddingHorizontal: 10,
+    paddingBottom: 7,
     flexWrap: "wrap" as const,
    },
    button: {
     flexDirection: "row" as const,
     alignItems: "center" as const,
     gap: 6,
-    paddingHorizontal: 10,
+    paddingHorizontal: 8,
     paddingVertical: 6,
     borderRadius: 8,
     backgroundColor: theme.colors.surface1,
     borderWidth: 1,
     borderColor: palette.splitDivider,
    },
-   buttonPrimary: { backgroundColor: theme.colors.accent, borderColor: theme.colors.accent },
-   buttonText: { color: palette.filePath, fontSize: metrics.fontSize },
-   buttonTextPrimary: { color: theme.colors.accentForeground, fontSize: metrics.fontSize },
-   disabled: { opacity: 0.45 },
-   buttonActive: { backgroundColor: theme.colors.accent, borderColor: theme.colors.accent },
-   buttonTextActive: { color: theme.colors.accentForeground, fontSize: metrics.fontSize },
-   body: { flex: 1, flexDirection: "row" as const, minHeight: 0 },
-   /** The sidebar's width comes from state; the handle beside it paints the
-    *  edge, so the rail carries no border of its own. */
-   rail: { flexShrink: 0 },
-   railWide: { flex: 1 },
-   /** Grab area for the sidebar's width: a 6px strip that paints a single line,
-    *  so the edge still looks like a border. */
-   sidebarHandle: {
-    width: 6,
-    flexShrink: 0,
-    alignItems: "center" as const,
-    justifyContent: "center" as const,
+   buttonPrimary: {
+    backgroundColor: theme.colors.accent,
+    borderColor: theme.colors.accent,
    },
-   sidebarHandleLine: { width: 1, flex: 1, backgroundColor: palette.splitDivider },
-   /** Grab area between the two sections, shown only while both are open. */
+   buttonText: {
+    color: palette.filePath,
+    fontSize: metrics.fontSize,
+   },
+   buttonTextPrimary: {
+    color: theme.colors.accentForeground,
+    fontSize: metrics.fontSize,
+   },
+   muted: {
+    color: palette.filePathMuted,
+    fontSize: metrics.fontSize,
+   },
+   disabled: { opacity: 0.45 },
    splitHandle: { height: 7, justifyContent: "center" as const },
    splitHandleLine: { height: 1, backgroundColor: palette.splitDivider },
    railDivider: { height: 1, backgroundColor: palette.splitDivider },
    composer: {
     borderTopWidth: 1,
     borderColor: palette.splitDivider,
-    padding: layout.compact ? 10 : 12,
+    padding: 10,
     gap: 8,
     backgroundColor: theme.colors.surface1,
    },
@@ -595,28 +545,6 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
     padding: 24,
     gap: 8,
    },
-   banner: {
-    marginHorizontal: layout.compact ? 12 : 16,
-    marginBottom: 8,
-    padding: 10,
-    borderRadius: 8,
-    backgroundColor: theme.colors.surface1,
-    borderLeftWidth: 3,
-    borderLeftColor: palette.conflict,
-    gap: 4,
-   },
-   confirmBar: {
-    flexDirection: "row" as const,
-    alignItems: "center" as const,
-    gap: 8,
-    padding: 10,
-    backgroundColor: theme.colors.surface1,
-    borderTopWidth: 1,
-    borderColor: palette.splitDivider,
-   },
-   /** The drag HUD. It follows the pointer in viewport coordinates, which only
-    *  the web host can express, so this is the fallback position and the web
-    *  one is layered over it at the render site. */
    dragHud: {
     position: "absolute" as const,
     paddingHorizontal: 8,
@@ -626,115 +554,38 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
     borderWidth: 1,
     borderColor: theme.colors.accent,
    },
-   dragHudText: { color: palette.filePath, fontSize: metrics.fontSize },
+   dragHudText: {
+    color: palette.filePath,
+    fontSize: metrics.fontSize,
+   },
   }),
-  [palette, theme, metrics, layout.compact],
+  [palette, theme, metrics],
  );
 
- /**
-  * The file tree is the ordering authority for both surfaces, so a picked path
-  * is already the id Pierre keys that file's rendered item by.
-  */
- const scrollToFile = useCallback((path: string) => {
-  diffRef.current?.scrollToFile(path);
- }, []);
 
- /**
-  * The hunk buttons in a file header move one hunk out of the revision on
-  * screen and into that revision's parent: their "reject" means the change
-  * leaves this revision. "Accept" keeps it here, which is what jj does when
-  * asked for nothing. The destination is written as the displayed revset's own
-  * parent so the hunk numbering the server checks against is the one on screen.
-  */
- const squashHunks = useSquashHunks(workspaceId);
- const onHunkAction = useCallback(
-  (input: HunkActionInput) => {
-   if (input.kind === "accept") {
-    toast.show(`Hunk ${input.hunkIndex + 1} stays in this revision`);
-    return;
-   }
-   squashHunks({
-    file: input.file,
-    hunkIndexes: [input.hunkIndex],
-    from: revset,
-    into: `(${revset})-`,
-   }).catch((error: unknown) => {
-    // jj's own words: it refuses an immutable destination and hunks that no
-    // longer match with a message the reader can act on.
-    toast.show(error instanceof Error ? error.message : "jj refused to move that hunk");
-   });
-  },
-  [revset, squashHunks, toast],
+ /** The graph names revisions by change id, but the diff pane keys its working-copy
+  *  controls (composer, discard, in-place edit) on `@`. Picking the working copy's
+  *  own row therefore selects `@`, or those controls could never come back. */
+ const paneRevset = useCallback(
+  (changeId: string) => (changeId === snapshot?.current?.changeId ? "@" : changeId),
+  [snapshot?.current?.changeId],
  );
 
- /**
-  * An inline edit needs the file's text, and the diff only carries hunks: the
-  * panel reads both sides from the range that starts at the empty root revision,
-  * where every line of the file arrives as an addition. `expected` is that same
-  * text, so the server refuses a write built on a read an agent has since made
-  * stale instead of overwriting their work.
-  */
- const editAccess = useMemo<FileEditAccess | undefined>(() => {
-  if (revset !== "@") return undefined;
-  return {
-   async read(path: string) {
-    const [current, parent] = await Promise.all([
-     callDiff({ directory: directory ?? "", revset: "root()..@", path }),
-     callDiff({ directory: directory ?? "", revset: "root()..@-", path }),
-    ]);
-    const newText = wholeFileText(current.files);
-    if (newText === null) {
-     throw new Error(current.error ?? `The panel could not read ${path}.`);
-    }
-    return { oldText: wholeFileText(parent.files) ?? "", newText };
-   },
-   async write({ path, content, expected }) {
-    const result = await callWriteFile({ directory: directory ?? "", path, content, expected });
-    if (result.ok) {
-     toast.show(`Wrote ${path}`, { variant: "success" });
-    } else {
-     // The server's own words, which name what went wrong and leave the file
-     // alone: a stale read, a path outside the workspace, a file too large.
-     toast.error(result.error ?? "The write was refused.");
-    }
-    // jj snapshots the working copy on its next command, so the diff is re-read
-    // either way: on a write it shows the edit, on a refusal it shows the file
-    // as it really is.
-    await Promise.all([
-     queryClient.invalidateQueries({ queryKey: ["jj", "snapshot"] }),
-     queryClient.invalidateQueries({ queryKey: ["jj", "diff"] }),
-    ]);
-    return result;
-   },
-  };
- }, [callDiff, callWriteFile, directory, queryClient, revset, toast]);
+ /** File selection focuses the singleton diff pane at the selected file. */
+ const selectFile = useCallback((path: string) => {
+  setSelectedPath(path);
+  focusFile(workspaceId, path);
+  openDiffPane(workspaceId);
+ }, [workspaceId]);
 
- const selectFile = useCallback(
-  (path: string) => {
-   setSelectedPath(path);
-   scrollToFile(path);
-   // On a narrow pane the tree replaces the diff, so a picked file is done and
-   // the reader wants the diff back.
-   if (layout.compact) setTreeVisible(false);
-  },
-  [layout.compact, scrollToFile],
- );
-
- /** The sidebar selects the revision the diff reads; on a narrow pane that is
-  *  the whole errand, so it hands the pane back to the diff. Ctrl/cmd-click adds
-  *  the row to the selection instead of moving the diff to it. */
- const selectRevision = useCallback(
-  (changeId: string) => {
-   // The press that ends a drag lands on a row as well. It is the tail of a
-   // gesture that has already run its verb, not a request to read that revision.
-   if (suppressSelect.current) return;
-   setRevset(changeId);
-   setSelectedPath(null);
-   setSelection((current) => clickedSelection(current, changeId, held.additive));
-   if (layout.compact) setTreeVisible(false);
-  },
-  [held.additive, layout.compact],
- );
+ /** Revision selection updates the graph and opens the matching diff. */
+ const selectRevision = useCallback((changeId: string) => {
+  if (suppressSelect.current) return;
+  selectPaneRevision(workspaceId, paneRevset(changeId));
+  setSelectedPath(null);
+  setSelection((current) => clickedSelection(current, changeId, held.additive));
+  openDiffPane(workspaceId);
+ }, [held.additive, paneRevset, workspaceId]);
 
  const toggleFolder = useCallback((path: string) => {
   setCollapsedFolders((folders) => {
@@ -797,56 +648,43 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
   [bulkAction, directory],
  );
 
- /** A pick means whatever the picker was opened for: a revision to read, a
- /** A pick means whatever the picker was opened for: a revision to read, a
-  *  second parent to merge, a destination to rebase onto, the revision the
-  *  picked files move into, or — when it was opened from a bulk verb — the
-  *  destination for a whole selection. */
- const pickRevision = useCallback(
-  (id: string) => {
-   const purpose = picker;
-   setPicker(null);
-   if (purpose === "squash-files") {
-    runAction.mutate(
-     {
-      directory: directory ?? "",
-      action: "squash",
-      revset: selectedChangeId ?? undefined,
-      target: id,
-      paths: [...checkedFiles],
-     },
-     // The pick is only spent once jj took it: a destination it refuses leaves
-     // the selection standing, ready for another try.
-     {
-      onSuccess: (result) => {
-       if (result.ok) setCheckedPaths(new Set());
-      },
-     },
-    );
+
+ const pickRevision = useCallback((id: string) => {
+  const purpose = picker;
+  setPicker(null);
+  if (purpose === "squash-files") {
+   runAction.mutate({
+    directory: directory ?? "",
+    action: "squash",
+    revset: selectedChangeId ?? undefined,
+    target: id,
+    paths: [...checkedFiles],
+   }, {
+    onSuccess: (result) => {
+     if (result.ok) setCheckedPaths(new Set());
+    },
+   });
+   return;
+  }
+  if (purpose === "merge" || purpose === "rebase" || purpose === "squash") {
+   const revs = pickerTargets;
+   setPickerTargets(null);
+   if (revs !== null) {
+    runBulk("rebase", revs, id);
     return;
    }
-   if (purpose === "merge" || purpose === "rebase" || purpose === "squash") {
-    // The picker can only carry one value, so the selection it was opened for
-    // waits here; a pick arriving without one is the single-revision verb.
-    const revs = pickerTargets;
-    setPickerTargets(null);
-    if (revs !== null) {
-     runBulk("rebase", revs, id);
-     return;
-    }
-    runAction.mutate({
-     directory: directory ?? "",
-     action: purpose,
-     revset: selectedChangeId ?? undefined,
-     target: id,
-    });
-    return;
-   }
-   setRevset(id);
-   setSelectedPath(null);
-  },
-  [checkedFiles, directory, picker, pickerTargets, runAction, runBulk, selectedChangeId],
- );
+   runAction.mutate({
+    directory: directory ?? "",
+    action: purpose,
+    revset: selectedChangeId ?? undefined,
+    target: id,
+   });
+   return;
+  }
+  selectPaneRevision(workspaceId, paneRevset(id));
+  setSelectedPath(null);
+  openDiffPane(workspaceId);
+ }, [checkedFiles, directory, paneRevset, picker, pickerTargets, runAction, runBulk, selectedChangeId, workspaceId]);
 
  const setBookmark = useCallback(() => {
   const name = bookmarkName.trim();
@@ -990,119 +828,18 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
     : `Move bookmark ${drag.bookmark} to`;
 
  return (
-  <View style={styles.screen}>
+  <View style={styles.screen} testID="jj-changes">
    <View style={styles.header}>
     <View style={styles.row}>
-     <Pressable
-      accessibilityRole="button"
-      accessibilityLabel="Copy the change id"
-      onPress={() => {
-       const id = current?.changeId;
-       if (!id) return;
-       void copyText(id)
-        .then(() => toast.show(`Copied ${id}`, { variant: "success" }))
-        .catch(() => toast.error("Could not copy the change id."));
-      }}
-     >
-      <Text style={styles.changeId}>{current?.changeId.slice(0, 8) ?? "--------"}</Text>
-     </Pressable>
-     {current?.conflicted ? (
-      <View style={[styles.chip, { borderColor: palette.conflict }]}>
-       <Text style={[styles.chipText, { color: palette.conflict }]}>conflicted</Text>
-      </View>
-     ) : null}
-     {isEmpty ? (
-      <View style={styles.chip}>
-       <Text style={styles.chipText}>empty</Text>
-      </View>
-     ) : null}
-     {current?.divergent ? (
-      <View style={[styles.chip, { borderColor: palette.conflict }]}>
-       <Text style={[styles.chipText, { color: palette.conflict }]}>divergent</Text>
-      </View>
-     ) : null}
-     {current?.bookmarks.map((bookmark) => (
-      <View key={bookmark} style={[styles.chip, styles.chipActive]}>
-       <Text style={styles.chipTextActive}>{bookmark}</Text>
-      </View>
-     ))}
-     {current?.tags.map((tag) => (
-      <View key={tag} style={styles.chip}>
-       <Text style={styles.chipText}>{tag}</Text>
-      </View>
-     ))}
-    </View>
-    <Text style={styles.description} numberOfLines={3}>
-     {current?.description.trim() || "No description yet"}
-    </Text>
-    {current ? (
-     <Text style={styles.muted} numberOfLines={1}>
-      {current.author} · {current.age}
-      {current.committer && current.committer !== current.author
-       ? ` · committed by ${current.committer}`
-       : ""}
+     <Text style={styles.changeId}>
+      {current?.changeId.slice(0, 8) ?? "--------"}
      </Text>
-    ) : null}
+     <Text style={styles.description} numberOfLines={1}>
+      {current?.description.trim() || "No description yet"}
+     </Text>
+    </View>
    </View>
-
-   {snapshot.conflicts.length > 0 ? (
-    <View style={styles.banner}>
-     <Text style={[styles.buttonText, { color: palette.conflict }]}>
-      {snapshot.conflicts.length} conflicted file{snapshot.conflicts.length === 1 ? "" : "s"}
-     </Text>
-     <Text style={styles.muted}>{snapshot.conflicts.join(", ")}</Text>
-    </View>
-   ) : null}
-
-   {snapshot.error ? (
-    <View style={styles.banner}>
-     <Text style={[styles.buttonText, { color: palette.removedCount }]}>
-      jj could not read this workspace
-     </Text>
-     <Text style={styles.muted}>{snapshot.error}</Text>
-    </View>
-   ) : null}
-
    <View style={styles.toolbar}>
-    <RevisionTrigger
-     label={revisionName}
-     open={picker !== null}
-     onPress={() => setPicker("select")}
-     palette={palette}
-     theme={theme}
-     metrics={metrics}
-     maxWidth={layout.compact ? 150 : 240}
-    />
-   </View>
-
-   <View style={styles.toolbar}>
-    <Pressable
-     accessibilityRole="button"
-     accessibilityLabel={treeVisible ? "Hide the sidebar" : "Show the sidebar"}
-     onPress={() => setTreeVisible(!treeVisible)}
-     style={[styles.button, treeVisible ? styles.buttonActive : null]}
-    >
-     <Icon
-      name="PanelRight"
-      size={14}
-      color={treeVisible ? theme.colors.accentForeground : palette.filePath}
-     />
-     <Text style={treeVisible ? styles.buttonTextActive : styles.buttonText}>
-      {layout.compact && treeVisible ? "Diff" : "Sidebar"}
-     </Text>
-    </Pressable>
-
-    <Pressable
-     accessibilityRole="button"
-     accessibilityLabel={split ? "Switch to unified diff" : "Switch to split diff"}
-     onPress={() => setSplit((value) => !value)}
-     disabled={layout.compact}
-     style={[styles.button, layout.compact ? styles.disabled : null]}
-    >
-     <Icon name={split ? "AlignJustify" : "Columns"} size={14} color={palette.filePath} />
-     <Text style={styles.buttonText}>{split ? "Unified" : "Split"}</Text>
-    </Pressable>
-
     <Pressable
      accessibilityRole="button"
      accessibilityLabel="Start a new change"
@@ -1113,7 +850,6 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
      <Icon name="Plus" size={14} color={palette.filePath} />
      <Text style={styles.buttonText}>New change</Text>
     </Pressable>
-
     <Pressable
      accessibilityRole="button"
      accessibilityLabel="Undo the last jj operation"
@@ -1124,10 +860,9 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
      <Icon name="Undo2" size={14} color={palette.filePath} />
      <Text style={styles.buttonText}>Undo</Text>
     </Pressable>
-
     <Pressable
      accessibilityRole="button"
-     accessibilityLabel="Refresh the diff"
+     accessibilityLabel="Refresh changes"
      onPress={() => {
       void queryClient.invalidateQueries({ queryKey: ["jj"] });
      }}
@@ -1137,181 +872,95 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
      <Text style={styles.buttonText}>Refresh</Text>
     </Pressable>
    </View>
-
-   {diffQuery.data?.truncated ? (
-    <View style={styles.banner}>
-     <Text style={styles.buttonText}>This diff is truncated</Text>
-     <Text style={styles.muted}>
-      Only the first files are shown. Pick a narrower revision or a single path.
-     </Text>
-    </View>
-   ) : null}
-
-   {diffQuery.data?.error ? (
-    <View style={styles.banner}>
-     <Text style={[styles.buttonText, { color: palette.removedCount }]}>{diffQuery.data.error}</Text>
-    </View>
-   ) : null}
-
    <View
-    style={styles.body}
+    style={[styles.screen, { minHeight: 0 }]}
+    onLayout={(event) => {
+     splitHeightRef.current = event.nativeEvent.layout.height;
+    }}
     onPointerMove={onDragMove}
     onPointerUp={endDrag}
     onPointerLeave={endDrag}
     onPointerCancel={endDrag}
    >
-    {treeVisible && layout.compact ? null : orderedFiles.length === 0 ? (
-     <View style={styles.center}>
-      <Text style={styles.muted}>
-       {diffQuery.isPending
-        ? "Loading the diff…"
-        : isEmpty
-         ? "This change is empty. Edits an agent makes will appear here."
-         : "No content changes in this revision."}
-      </Text>
-     </View>
-    ) : (
-     <PierreDiffView
-      files={orderedFiles}
-      split={split}
+    <View style={{ flex: filesFlex, minHeight: filesMinimized ? 32 : 0 }}>
+     <FileTreeRail
+      rows={fileTree.rows}
+      collapsed={collapsedFolders}
+      selectedPath={selectedPath}
+      checked={checkedFiles}
+      allChecked={allFilesChecked}
+      busy={busy}
+      onToggleChecked={toggleChecked}
+      onToggleCheckAll={toggleCheckAll}
+      onSquashChecked={askWhereCheckedGo}
+      allCollapsed={allCollapsed}
+      loading={diffQuery.isPending}
+      flex={1}
+      minimized={filesMinimized}
+      onToggleMinimized={() => setFilesMinimized((value) => !value)}
+      onToggleFolder={toggleFolder}
+      onToggleCollapseAll={toggleCollapseAll}
+      onSelectFile={selectFile}
       palette={palette}
-      onRevertFile={revset === "@" ? setPendingRevert : undefined}
-      onHunkAction={onHunkAction}
-      edit={editAccess}
-      handleRef={diffRef}
+      metrics={metrics}
+      theme={theme}
      />
-    )}
-
-    {treeVisible && !layout.compact ? (
+    </View>
+    {filesMinimized || revisionsMinimized ? (
+     <View style={styles.railDivider} />
+    ) : (
      <View
-      style={[styles.sidebarHandle, resizeCursor]}
-      accessibilityLabel="Resize the sidebar"
+      style={[styles.splitHandle, splitCursor]}
+      accessibilityLabel="Resize the changes sections"
       onPointerDown={(event) => {
-       // Without this the browser starts a text selection over the pane, turns
-       // that into a native drag and cancels the pointer stream mid-gesture.
        event.preventDefault();
-       sidebarDrag.current = {
-        startX: event.nativeEvent.pageX,
-        startWidth: sidebarWidthRef.current,
+       splitDrag.current = {
+        startY: event.nativeEvent.pageY,
+        startRatio: splitRatioRef.current,
        };
       }}
      >
-      <View style={styles.sidebarHandleLine} />
+      <View style={styles.splitHandleLine} />
      </View>
-    ) : null}
-
-    {treeVisible ? (
-     <View
-      style={layout.compact ? styles.railWide : [styles.rail, { width: sidebarWidth }]}
-      onLayout={(event) => {
-       sidebarHeightRef.current = event.nativeEvent.layout.height;
-      }}
-     >
-      <FileTreeRail
-       rows={fileTree.rows}
-       collapsed={collapsedFolders}
-       selectedPath={selectedPath}
-       checked={checkedFiles}
-       allChecked={allFilesChecked}
-       busy={busy}
-       onToggleChecked={toggleChecked}
-       onToggleCheckAll={toggleCheckAll}
-       onSquashChecked={askWhereCheckedGo}
-       allCollapsed={allCollapsed}
-       loading={diffQuery.isPending}
-       flex={filesFlex}
-       minimized={filesMinimized}
-       onToggleMinimized={() => setFilesMinimized((value) => !value)}
-       onToggleFolder={toggleFolder}
-       onToggleCollapseAll={toggleCollapseAll}
-       onSelectFile={selectFile}
-       palette={palette}
-       metrics={metrics}
-       theme={theme}
-      />
-      {filesMinimized || revisionsMinimized ? (
-       <View style={styles.railDivider} />
-      ) : (
-       <View
-        style={[styles.splitHandle, splitCursor]}
-        accessibilityLabel="Resize the sidebar sections"
-        onPointerDown={(event) => {
-         event.preventDefault();
-         splitDrag.current = {
-          startY: event.nativeEvent.pageY,
-          startRatio: splitRatioRef.current,
-         };
-        }}
-       >
-        <View style={styles.splitHandleLine} />
-       </View>
-      )}
-      <GraphView
-       changes={snapshot?.graph ?? []}
-       selectedChangeId={selectedChangeId}
-       currentChangeId={snapshot?.current?.changeId ?? null}
-       selection={selection}
-       drag={drag}
-       loading={snapshotQuery.isPending}
-       flex={revisionsFlex}
-       minimized={revisionsMinimized}
-       onToggleMinimized={() => setRevisionsMinimized((value) => !value)}
-       onSelect={selectRevision}
-       onDragStart={startDrag}
-       onDragOver={onDragOver}
-       onOpenActions={() => setActionsOpen(true)}
-       palette={palette}
-       metrics={metrics}
-       theme={theme}
-      />
-      {layout.compact || revisionsMinimized ? null : (
-       <BranchBar
-        selectionLabel={revisionName}
-        bookmarks={selectedBookmarks}
-        bookmarkName={bookmarkName}
-        onBookmarkNameChange={setBookmarkName}
-        pendingDelete={pendingBookmarkDelete}
-        busy={busy}
-        onSet={setBookmark}
-        onDelete={deleteBookmark}
-        onConfirmDelete={confirmBookmarkDelete}
-        onCancelDelete={() => setPendingBookmarkDelete(null)}
-        onMerge={() => setPicker("merge")}
-        onRebase={() => setPicker("rebase")}
-        palette={palette}
-        metrics={metrics}
-        theme={theme}
-       />
-      )}
-     </View>
-    ) : null}
-   </View>
-
-   {pendingRevert ? (
-    <View style={styles.confirmBar}>
-     <Text style={[styles.muted, { flex: 1 }]} numberOfLines={2}>
-      Discard changes to {pendingRevert}?
-     </Text>
-     <Pressable
-      accessibilityRole="button"
-      accessibilityLabel="Confirm discard"
-      onPress={() => runAction.mutate({ directory, action: "restore", paths: [pendingRevert] })}
-      disabled={busy}
-      style={[styles.button, { borderColor: palette.removedCount }, busy ? styles.disabled : null]}
-     >
-      <Text style={[styles.buttonText, { color: palette.removedCount }]}>Discard</Text>
-     </Pressable>
-     <Pressable
-      accessibilityRole="button"
-      accessibilityLabel="Cancel discard"
-      onPress={() => setPendingRevert(null)}
-      style={styles.button}
-     >
-      <Text style={styles.buttonText}>Cancel</Text>
-     </Pressable>
+    )}
+    <View style={{ flex: revisionsFlex, minHeight: revisionsMinimized ? 32 : 0 }}>
+     <GraphView
+      changes={snapshot?.graph ?? []}
+      selectedChangeId={selectedChangeId}
+      currentChangeId={snapshot?.current?.changeId ?? null}
+      selection={selection}
+      drag={drag}
+      loading={snapshotQuery.isPending}
+      flex={1}
+      minimized={revisionsMinimized}
+      onToggleMinimized={() => setRevisionsMinimized((value) => !value)}
+      onSelect={selectRevision}
+      onDragStart={startDrag}
+      onDragOver={onDragOver}
+      onOpenActions={() => setActionsOpen(true)}
+      palette={palette}
+      metrics={metrics}
+      theme={theme}
+     />
     </View>
-   ) : null}
-
+    <BranchBar
+     selectionLabel={revisionName}
+     bookmarks={selectedBookmarks}
+     bookmarkName={bookmarkName}
+     onBookmarkNameChange={setBookmarkName}
+     pendingDelete={pendingBookmarkDelete}
+     busy={busy}
+     onSet={setBookmark}
+     onDelete={deleteBookmark}
+     onConfirmDelete={confirmBookmarkDelete}
+     onCancelDelete={() => setPendingBookmarkDelete(null)}
+     onMerge={() => setPicker("merge")}
+     onRebase={() => setPicker("rebase")}
+     palette={palette}
+     metrics={metrics}
+     theme={theme}
+    />
+   </View>
    {revset === "@" ? (
     <View style={styles.composer}>
      <TextInput
@@ -1351,7 +1000,6 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
      </View>
     </View>
    ) : null}
-
    {picker ? (
     <RevisionPickerOverlay
      title={PICKER_TITLE[picker]}
@@ -1368,7 +1016,6 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
      compact={layout.compact}
     />
    ) : null}
-
    {actionsOpen ? (
     <RevisionActionsOverlay
      selectionLabel={bulk ? `${targets.length} revisions` : revisionName}
@@ -1383,7 +1030,6 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
      compact={layout.compact}
     />
    ) : null}
-
    {drag ? (
     <View
      // The HUD sits under the pointer, which is where the drop is: it must not

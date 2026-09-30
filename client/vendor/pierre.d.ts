@@ -3,8 +3,8 @@
  * bundle; the declarations come from the installed package, which is the same
  * version the bundle was built from.
  */
-export { parsePatchFiles } from "@pierre/diffs";
-export type { FileDiffMetadata } from "@pierre/diffs";
+export { parsePatchFiles, processFile } from "@pierre/diffs";
+export type { DiffLineAnnotation, FileDiffMetadata } from "@pierre/diffs";
 export { CodeView, EditProvider } from "@pierre/diffs/react";
 export type { CodeViewHandle, CodeViewItem } from "@pierre/diffs/react";
 export { Editor } from "@pierre/diffs/edit";
