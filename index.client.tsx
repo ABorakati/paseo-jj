@@ -1,7 +1,8 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
 import { ChangesPanel } from "./client/changes-panel";
 import { DiffPane } from "./client/diff-pane";
-import { setDiffOpener } from "./client/pane-store";
+import { FilePane } from "./client/file-pane";
+import { setPanelOpener } from "./client/pane-store";
 
 export default function contribute(client: PluginClientContext) {
   const removeChanges = client.addWorkspacePanel({
@@ -19,6 +20,14 @@ export default function contribute(client: PluginClientContext) {
     context: "workspace",
     locations: ["workspace"],
     Component: DiffPane,
+  });
+  const removeFile = client.addWorkspacePanel({
+    id: "file",
+    title: "jj file",
+    icon: "FileCode",
+    context: "workspace",
+    locations: ["workspace"],
+    Component: FilePane,
   });
   const removeOpenChanges = client.addCommandCenterItem({
     id: "open-changes",
@@ -40,14 +49,15 @@ export default function contribute(client: PluginClientContext) {
       openPanel("diff", { location: "workspace" });
     },
   });
-  setDiffOpener((workspaceId) => {
-    client.openPanel("diff", { workspaceId, location: "workspace" });
+  setPanelOpener((workspaceId, panelId) => {
+    client.openPanel(panelId, { workspaceId, location: "workspace" });
   });
   return () => {
     removeChanges();
     removeDiff();
+    removeFile();
     removeOpenChanges();
     removeOpenDiff();
-    setDiffOpener(null);
+    setPanelOpener(null);
   };
 }

@@ -221,3 +221,22 @@ export const writeFileRpc = defineRpc({
  }),
 });
 
+/**
+ * One file's exact text at a revision, for the file tab. The diff carries only
+ * hunks, and rebuilding a file from them loses its final-newline state and stops
+ * at the diff's size cap, so the whole file is read from jj instead. `text` is
+ * null when there is no text to show, and `reason` says why.
+ */
+export const readFileRpc = defineRpc({
+ name: "jj.read-file",
+ input: z.object({
+  directory: z.string(),
+  revset: z.string(),
+  path: z.string(),
+ }),
+ output: z.object({
+  text: z.string().nullable(),
+  reason: z.string().nullable(),
+ }),
+});
+

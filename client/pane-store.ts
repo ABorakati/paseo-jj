@@ -4,12 +4,17 @@ export interface PaneState {
   revset: string;
   focus: { path: string; nonce: number } | null;
   epoch: number;
+  /** The file the file tab shows, and the revision it is read at. */
+  file: { path: string; revset: string } | null;
 }
 
-const initialState: PaneState = { revset: "@", focus: null, epoch: 0 };
+/** The panels a pane can open: the diff, or one whole file. */
+export type PanelId = "diff" | "file";
+
+const initialState: PaneState = { revset: "@", focus: null, epoch: 0, file: null };
 const states = new Map<string, PaneState>();
 const listeners = new Map<string, Set<() => void>>();
-let diffOpener: ((workspaceId: string) => void) | null = null;
+let panelOpener: ((workspaceId: string, panelId: PanelId) => void) | null = null;
 
 export function getPaneState(workspaceId: string): PaneState {
   return states.get(workspaceId) ?? initialState;
@@ -59,10 +64,19 @@ export function usePaneState(workspaceId: string): PaneState {
   );
 }
 
-export function setDiffOpener(fn: ((workspaceId: string) => void) | null): void {
-  diffOpener = fn;
+/** Set by the plugin entry, which holds the host's `openPanel`. */
+export function setPanelOpener(fn: ((workspaceId: string, panelId: PanelId) => void) | null): void {
+  panelOpener = fn;
 }
 
 export function openDiffPane(workspaceId: string): void {
-  diffOpener?.(workspaceId);
+  panelOpener?.(workspaceId, "diff");
+}
+
+/** Shows `path` as it is at `revset` in the file tab, and opens or focuses it. */
+export function openFile(workspaceId: string, path: string, revset: string): void {
+  update(workspaceId, (state) =>
+    state.file?.path === path && state.file.revset === revset ? state : { ...state, file: { path, revset } },
+  );
+  panelOpener?.(workspaceId, "file");
 }

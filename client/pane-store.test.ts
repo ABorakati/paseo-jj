@@ -4,8 +4,9 @@ import {
   focusFile,
   getPaneState,
   openDiffPane,
+  openFile,
   selectRevision,
-  setDiffOpener,
+  setPanelOpener,
   subscribePaneState,
 } from "./pane-store";
 
@@ -20,11 +21,13 @@ import {
     revset: "change-a",
     focus: { path: "src/a.ts", nonce: 2 },
     epoch: 0,
+    file: null,
   });
   assert.deepEqual(getPaneState("store-b"), {
     revset: "change-b",
     focus: { path: "src/b.ts", nonce: 1 },
     epoch: 0,
+    file: null,
   });
 }
 
@@ -35,14 +38,24 @@ import {
   bumpEpoch("store-notify");
   unsubscribe();
   assert.equal(notifications, 2);
-  assert.deepEqual(getPaneState("store-notify"), { revset: "change-c", focus: null, epoch: 1 });
+  assert.deepEqual(getPaneState("store-notify"), {
+    revset: "change-c",
+    focus: null,
+    epoch: 1,
+    file: null,
+  });
 }
 
 {
-  let opened: string | null = null;
-  setDiffOpener((workspaceId) => { opened = workspaceId; });
+  const opened: string[] = [];
+  setPanelOpener((workspaceId, panelId) => { opened.push(`${workspaceId}:${panelId}`); });
   openDiffPane("store-a");
-  assert.equal(opened, "store-a");
+  openFile("store-file", "src/c.ts", "change-d");
+  // The file tab keeps the revision it was opened at when the diff moves on.
+  selectRevision("store-file", "change-e");
+  assert.deepEqual(opened, ["store-a:diff", "store-file:file"]);
+  assert.deepEqual(getPaneState("store-file").file, { path: "src/c.ts", revset: "change-d" });
+  setPanelOpener(null);
 }
 
 console.log("pane-store.test.ts: all assertions passed");

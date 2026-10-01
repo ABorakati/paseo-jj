@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import type { RpcInput, RpcOutput } from "@getpaseo/plugin";
-import { actionRpc, diffRpc, snapshotRpc, writeFileRpc } from "../shared/contracts";
+import { actionRpc, diffRpc, readFileRpc, snapshotRpc, writeFileRpc } from "../shared/contracts";
 import { applyHunks, describeFile, parseGitDiff, shouldHighlight } from "./diff";
 import {
  findRepoRoot,
@@ -476,7 +476,7 @@ export async function writeFile({
  // The panel watches agents edit these same files, so an edit built from a read
  // that has since gone stale is refused rather than allowed to overwrite them.
  if (expected !== undefined && expected !== readFileSync(absolute, "utf8")) {
-  return { ok: false, error: "That file changed since the diff was read. Refresh and edit again." };
+  return { ok: false, error: "That file changed on disk after it was opened. Revert or refresh, then edit again." };
  }
  if (Buffer.byteLength(content, "utf8") > MAX_FILE_BYTES) {
   return { ok: false, error: "That file is too large to edit in the panel." };
@@ -484,5 +484,38 @@ export async function writeFile({
 
  writeFileSync(absolute, content, "utf8");
  return { ok: true, error: null };
+}
+
+/**
+ * A file's text at a revision, read with `jj file show`. For `@` jj snapshots
+ * the working copy first, so the text is what is on disk — which is what the
+ * guarded write compares against. The path is quoted as a `root-file:` fileset,
+ * so a name with fileset syntax in it still names exactly that one file.
+ */
+export async function readFile({
+ directory,
+ revset,
+ path: requested,
+}: RpcInput<typeof readFileRpc>): Promise<RpcOutput<typeof readFileRpc>> {
+ const root = await findRepoRoot(directory);
+ if (root === null) return { text: null, reason: "This workspace is not a jj repository." };
+ const revision = safeArg(revset);
+ const path = safeArg(requested);
+ if (!revision || !path) return { text: null, reason: "That file cannot be read." };
+
+ const result = await runJj(
+  ["file", "show", "-r", revision, "--", `root-file:${JSON.stringify(path)}`],
+  root,
+ );
+ if (!result.ok) return { text: null, reason: result.stderr || "jj could not read that file." };
+ if (Buffer.byteLength(result.stdout, "utf8") > MAX_FILE_BYTES) {
+  return { text: null, reason: "This file is too large to open in the panel." };
+ }
+ // A NUL byte or an undecodable sequence means the bytes are not UTF-8 text;
+ // showing the decoded string would offer to save a corrupted copy.
+ if (result.stdout.includes("\u0000") || result.stdout.includes("\uFFFD")) {
+  return { text: null, reason: "Binary file — no text to show." };
+ }
+ return { text: result.stdout, reason: null };
 }
 

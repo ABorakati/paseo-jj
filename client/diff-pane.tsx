@@ -13,7 +13,7 @@ import {
  type PierreDiffHandle,
 } from "./pierre-diff";
 import { wholeFileText } from "./pierre-patch";
-import { bumpEpoch, selectRevision, usePaneState } from "./pane-store";
+import { bumpEpoch, openFile, selectRevision, usePaneState } from "./pane-store";
 import { buildPalette } from "./palette";
 import { buildRevisionOptions, RevisionPickerOverlay, RevisionTrigger } from "./revision-picker";
 import { paneMetrics, POLL_MS } from "./pane-shared";
@@ -227,6 +227,12 @@ export function DiffPane({ theme, layout, workspaceId }: PluginWorkspacePanelPro
    },
   }),
   [layout.compact, metrics, palette, theme],
+ );
+
+ /** The file tab reads the file at the revision this diff shows. */
+ const openFileAtRevision = useCallback(
+  (path: string) => openFile(workspaceId, path, revset),
+  [revset, workspaceId],
  );
 
  const squashHunks = useSquashHunks(workspaceId);
@@ -525,6 +531,7 @@ export function DiffPane({ theme, layout, workspaceId }: PluginWorkspacePanelPro
      onRevertFile={revset === "@" ? setPendingRevert : undefined}
      onHunkAction={onHunkAction}
      edit={editAccess}
+     onOpenFile={openFileAtRevision}
      handleRef={diffRef}
     />
    )}

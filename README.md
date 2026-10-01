@@ -15,6 +15,10 @@ place.
 - **Edit in place**: double-click a line to open that file's editor with the caret on the line. Save writes the file
   back to the working copy. A save is refused if the file changed on disk after you opened it, so an agent's edit is
   never overwritten.
+- **Full file tab**: **Open file** in a diff header, or the file icon on a changed-file row, opens the whole file in a
+  **jj file** tab at the revision you are looking at. Working-copy files are editable there: **Save** (or
+  Ctrl/Cmd+S) writes through the same guard, **Revert** drops unsaved edits, and opening another file with unsaved
+  edits asks first. Files at other revisions are read-only. **Diff** jumps back to the file's diff.
 - **Per-hunk control**: **Move to parent** under each hunk moves just that hunk out of the revision and into its
   parent.
 - **History verbs** from the revision menu: edit, new child, insert before/after, duplicate, merge, rebase (branch
@@ -29,6 +33,8 @@ place.
 ![The revision actions menu](docs/screenshots/revision-actions.png)
 
 ![Editing a file in place from the diff](docs/screenshots/edit-in-place.png)
+
+![A whole file open in the jj file tab](docs/screenshots/file-tab.png)
 
 ## Requirements
 

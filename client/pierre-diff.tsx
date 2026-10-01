@@ -68,6 +68,8 @@ interface PierreDiffViewProps {
  onHunkAction?: (input: HunkActionInput) => void;
  /** Omitted outside the working copy: the panel edits the files it can write. */
  edit?: FileEditAccess;
+ /** Opens the whole file in the file tab, as it is at the revision on screen. */
+ onOpenFile?: (path: string) => void;
  handleRef?: Ref<PierreDiffHandle>;
 }
 
@@ -160,6 +162,7 @@ export const PierreDiffView = memo(function PierreDiffView({
  onRevertFile,
  onHunkAction,
  edit,
+ onOpenFile,
  handleRef,
 }: PierreDiffViewProps) {
  const viewRef = useRef<CodeViewHandle<HunkNote, undefined>>(null);
@@ -407,6 +410,18 @@ export const PierreDiffView = memo(function PierreDiffView({
    return (
     <div style={headerStyle}>
      {note === null ? null : <span style={NOTE_STYLE}>{note}</span>}
+     {/* A removed file has nothing left at this revision to open. */}
+     {onOpenFile === undefined || open || source.status === "removed" || source.binary ? null : (
+      <button
+       type="button"
+       style={buttonStyle}
+       title={`Open all of ${file.name} in the jj file tab`}
+       aria-label={`Open ${file.name} in the file tab`}
+       onClick={() => onOpenFile(file.name)}
+      >
+       Open file
+      </button>
+     )}
      {open ? (
       <>
        <button
@@ -447,7 +462,17 @@ export const PierreDiffView = memo(function PierreDiffView({
     </div>
    );
   },
-  [sources, edit, editing, headerStyle, buttonStyle, onRevertFile, palette.removedCount, palette.addedCount],
+  [
+   sources,
+   edit,
+   editing,
+   headerStyle,
+   buttonStyle,
+   onOpenFile,
+   onRevertFile,
+   palette.removedCount,
+   palette.addedCount,
+  ],
  );
 
  /** One control under each hunk: move that hunk into the parent revision. */

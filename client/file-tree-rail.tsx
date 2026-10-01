@@ -68,6 +68,8 @@ interface FileTreeRailProps {
  onToggleFolder(path: string): void;
  onToggleCollapseAll(): void;
  onSelectFile(path: string): void;
+ /** Opens the whole file in the file tab. */
+ onOpenFile(path: string): void;
  palette: DiffPalette;
  metrics: Metrics;
  theme: PluginTheme;
@@ -130,6 +132,7 @@ export function FileTreeRail({
  onToggleFolder,
  onToggleCollapseAll,
  onSelectFile,
+ onOpenFile,
  palette,
  metrics,
  theme,
@@ -194,6 +197,14 @@ export function FileTreeRail({
    },
    moveText: { color: palette.filePath, fontSize: metrics.fontSize - 1 },
    idle: { opacity: 0.45 },
+   open: {
+    width: 20,
+    height: 20,
+    borderRadius: 4,
+    alignItems: "center" as const,
+    justifyContent: "center" as const,
+    flexShrink: 0,
+   },
   }),
   [palette, metrics, theme],
  );
@@ -266,6 +277,23 @@ export function FileTreeRail({
        metrics={metrics}
       />
      </Pressable>
+     {/* A removed file has nothing left at this revision to open. */}
+     {item.status === "removed" ? (
+      <View style={styles.open} />
+     ) : (
+      <Pressable
+       accessibilityRole="button"
+       accessibilityLabel={`Open ${item.path} in the file tab`}
+       onPress={() => onOpenFile(item.path)}
+       hitSlop={6}
+       style={({ hovered }: { pressed: boolean; hovered?: boolean }) => [
+        styles.open,
+        hovered ? styles.rowActive : null,
+       ]}
+      >
+       <Icon name="FileCode" size={13} color={palette.filePathMuted} />
+      </Pressable>
+     )}
     </View>
    );
   },
@@ -273,6 +301,7 @@ export function FileTreeRail({
    checked,
    collapsed,
    metrics,
+   onOpenFile,
    onSelectFile,
    onToggleChecked,
    onToggleFolder,

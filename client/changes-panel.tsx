@@ -11,6 +11,7 @@ import {
  bumpEpoch,
  focusFile,
  openDiffPane,
+ openFile,
  selectRevision as selectPaneRevision,
  usePaneState,
 } from "./pane-store";
@@ -578,6 +579,12 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
   openDiffPane(workspaceId);
  }, [workspaceId]);
 
+ /** The file tab reads the file at the revision this pane lists. */
+ const openFileAtRevision = useCallback(
+  (path: string) => openFile(workspaceId, path, revset),
+  [revset, workspaceId],
+ );
+
  /** Revision selection updates the graph and opens the matching diff. */
  const selectRevision = useCallback((changeId: string) => {
   if (suppressSelect.current) return;
@@ -901,6 +908,7 @@ export function ChangesPanel({ theme, layout, workspaceId }: PluginWorkspacePane
       onToggleFolder={toggleFolder}
       onToggleCollapseAll={toggleCollapseAll}
       onSelectFile={selectFile}
+      onOpenFile={openFileAtRevision}
       palette={palette}
       metrics={metrics}
       theme={theme}
